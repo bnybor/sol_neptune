@@ -58,6 +58,18 @@ describe("SAM/CloudFormation architecture", () => {
     expect(template).toContain("BackupRetentionPeriod: 7");
   });
 
+  it("can omit per-function reservations when the regional quota is only ten", () => {
+    expect(template).toMatch(
+      /LambdaReservedConcurrency:\n\s+Type: Number\n\s+Default: 2\n\s+MinValue: 0/,
+    );
+    expect(template).toMatch(
+      /UseLambdaReservedConcurrency:\n\s+!Not \[!Equals \[!Ref LambdaReservedConcurrency, 0\]\]/,
+    );
+    expect(template.match(/ReservedConcurrentExecutions: !If/g)).toHaveLength(
+      2,
+    );
+  });
+
   it("does not import the Neptune SDK anywhere in the public MCP source", async () => {
     const sourceFiles = [
       "auth.ts",

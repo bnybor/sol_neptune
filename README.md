@@ -95,12 +95,14 @@ sam deploy \
   --no-execute-changeset \
   --parameter-overrides \
     McpEnabled=false \
-    CanonicalMcpUrl= \
-    OAuthIssuer= \
-    AllowedSubject= \
     NeptuneParameterGroupFamily=neptune1.4 \
-    NeptuneDeletionProtection=false
+    NeptuneDeletionProtection=false \
+    LambdaReservedConcurrency=2
 ```
+
+The omitted OAuth parameters use their fail-closed empty defaults in stage one; SAM rejects an empty `Key=` token in `--parameter-overrides`.
+
+AWS requires at least 10 regional executions to remain unreserved. If the account's regional concurrency quota is only 10, set `LambdaReservedConcurrency=0`; the account-level quota then provides the aggregate technical limit. Do not request a quota increase solely to bypass this deployment check. Restore the specified per-function value of `2` only after the regional quota can accommodate both reservations while retaining 10 unreserved executions.
 
 Inspect every change-set resource before execution. It must match the inventory in `scripts/aws-preflight.sh`; in particular it must contain one Neptune instance and none of the prohibited network or compute resources. Execute the reviewed change set only after Robyn approves it.
 
@@ -148,7 +150,8 @@ sam deploy \
     OAuthIssuer="$OAUTH_ISSUER" \
     AllowedSubject="$ROBYN_OAUTH_SUBJECT" \
     NeptuneParameterGroupFamily="$NEPTUNE_PARAMETER_GROUP_FAMILY" \
-    NeptuneDeletionProtection=false
+    NeptuneDeletionProtection=false \
+    LambdaReservedConcurrency="$LAMBDA_RESERVED_CONCURRENCY"
 ```
 
 Execute only the reviewed change set. Then verify protected-resource metadata, OAuth provider discovery, and rejection of unauthenticated execution before any mutation.

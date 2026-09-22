@@ -6,4 +6,4 @@ region = "us-east-1"
 capabilities = "CAPABILITY_IAM"
 confirm_changeset = true
 resolve_s3 = true
-parameter_overrides = "McpEnabled=false CanonicalMcpUrl= OAuthIssuer= AllowedSubject= NeptuneParameterGroupFamily=neptune1.4 NeptuneDeletionProtection=false"
+parameter_overrides = "McpEnabled=false NeptuneParameterGroupFamily=neptune1.4 NeptuneDeletionProtection=false LambdaReservedConcurrency=2"

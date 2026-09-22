@@ -31,9 +31,16 @@ Parameters:
     Default: "false"
     AllowedValues: ["true", "false"]
     Description: Set true only after the controlled integration test succeeds.
+  LambdaReservedConcurrency:
+    Type: Number
+    Default: 2
+    MinValue: 0
+    Description: Set to 0 to use the regional unreserved pool when the account quota cannot preserve AWS's required 10 unreserved executions.
 
 Conditions:
   DeletionProtectionEnabled: !Equals [!Ref NeptuneDeletionProtection, "true"]
+  UseLambdaReservedConcurrency:
+    !Not [!Equals [!Ref LambdaReservedConcurrency, 0]]
 
 Globals:
   Function:
@@ -217,7 +224,10 @@ Resources:
       CodeUri: .
       Handler: src/executor/handler.handler
       MemorySize: 512
-      ReservedConcurrentExecutions: 2
+      ReservedConcurrentExecutions: !If
+        - UseLambdaReservedConcurrency
+        - !Ref LambdaReservedConcurrency
+        - !Ref AWS::NoValue
       Timeout: 15
       VpcConfig:
         SecurityGroupIds:
@@ -264,7 +274,10 @@ Resources:
       CodeUri: .
       Handler: src/mcp/handler.handler
       MemorySize: 512
-      ReservedConcurrentExecutions: 2
+      ReservedConcurrentExecutions: !If
+        - UseLambdaReservedConcurrency
+        - !Ref LambdaReservedConcurrency
+        - !Ref AWS::NoValue
       Timeout: 25
       Environment:
         Variables:
