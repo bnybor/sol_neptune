@@ -260,10 +260,10 @@ Resources:
         Bundle: true
         EntryPoints:
           - src/executor/handler.ts
-        Format: esm
+        Format: cjs
         Minify: false
         OutExtension:
-          - .js=.mjs
+          - .js=.cjs
         Sourcemap: true
         Target: node24
 
@@ -302,10 +302,10 @@ Resources:
         Bundle: true
         EntryPoints:
           - src/mcp/handler.ts
-        Format: esm
+        Format: cjs
         Minify: false
         OutExtension:
-          - .js=.mjs
+          - .js=.cjs
         Sourcemap: true
         Target: node24
 

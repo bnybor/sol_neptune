@@ -70,6 +70,11 @@ describe("SAM/CloudFormation architecture", () => {
     );
   });
 
+  it("bundles both Lambda handlers as CommonJS for AWS SDK compatibility", () => {
+    expect(template.match(/Format: cjs/g)).toHaveLength(2);
+    expect(template.match(/\.js=\.cjs/g)).toHaveLength(2);
+  });
+
   it("does not import the Neptune SDK anywhere in the public MCP source", async () => {
     const sourceFiles = [
       "auth.ts",
