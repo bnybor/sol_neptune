@@ -1,0 +1,357 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Private Amazon Neptune graph with an OAuth-protected Streamable HTTP MCP endpoint.
+
+Parameters:
+  McpEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Keep false for the first deployment; enable only after OAuth is configured.
+  CanonicalMcpUrl:
+    Type: String
+    Default: ""
+    Description: Exact Lambda Function URL with /mcp appended; configured in deployment stage two.
+  OAuthIssuer:
+    Type: String
+    Default: ""
+    Description: Exact HTTPS OAuth/OIDC issuer identifier.
+  AllowedSubject:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: Immutable OAuth subject allowed to execute Gremlin.
+  NeptuneParameterGroupFamily:
+    Type: String
+    Default: neptune1.4
+    AllowedPattern: ^neptune[0-9]+(\.[0-9]+)?$
+    Description: Must match the current default Neptune engine selected during preflight.
+  NeptuneDeletionProtection:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Set true only after the controlled integration test succeeds.
+
+Conditions:
+  DeletionProtectionEnabled: !Equals [!Ref NeptuneDeletionProtection, "true"]
+
+Globals:
+  Function:
+    Runtime: nodejs24.x
+    Architectures: [arm64]
+    MemorySize: 512
+    Tracing: Disabled
+    Environment:
+      Variables:
+        NODE_OPTIONS: --enable-source-maps
+
+Resources:
+  GraphVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/24
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      InstanceTenancy: default
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-graph
+
+  IsolatedSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: 10.42.0.0/26
+      MapPublicIpOnLaunch: false
+      VpcId: !Ref GraphVpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-isolated-a
+
+  IsolatedSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: 10.42.0.64/26
+      MapPublicIpOnLaunch: false
+      VpcId: !Ref GraphVpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-isolated-b
+
+  IsolatedRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref GraphVpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-isolated-a
+
+  IsolatedRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref GraphVpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-isolated-b
+
+  IsolatedRouteTableAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref IsolatedRouteTableA
+      SubnetId: !Ref IsolatedSubnetA
+
+  IsolatedRouteTableAssociationB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref IsolatedRouteTableB
+      SubnetId: !Ref IsolatedSubnetB
+
+  ExecutorSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Egress from the private executor only to DNS and Neptune.
+      VpcId: !Ref GraphVpc
+      SecurityGroupEgress:
+        - Description: Neptune HTTPS Gremlin
+          IpProtocol: tcp
+          FromPort: 8182
+          ToPort: 8182
+          DestinationSecurityGroupId: !Ref NeptuneSecurityGroup
+        - Description: VPC DNS over UDP
+          IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 10.42.0.2/32
+        - Description: VPC DNS over TCP
+          IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 10.42.0.2/32
+
+  NeptuneSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Neptune ingress only from the private executor.
+      VpcId: !Ref GraphVpc
+      SecurityGroupEgress:
+        - Description: No effective initiated outbound path
+          IpProtocol: "-1"
+          CidrIp: 127.0.0.1/32
+
+  NeptuneIngressFromExecutor:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Gremlin from executor Lambda only
+      GroupId: !Ref NeptuneSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8182
+      ToPort: 8182
+      SourceSecurityGroupId: !Ref ExecutorSecurityGroup
+
+  NeptuneSubnetGroup:
+    Type: AWS::Neptune::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Exactly two isolated subnets for the Sol Neptune cluster.
+      SubnetIds:
+        - !Ref IsolatedSubnetA
+        - !Ref IsolatedSubnetB
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-isolated
+
+  NeptuneClusterParameterGroup:
+    Type: AWS::Neptune::DBClusterParameterGroup
+    Properties:
+      Description: !Sub ${AWS::StackName} cluster parameters
+      Family: !Ref NeptuneParameterGroupFamily
+      Parameters:
+        neptune_query_timeout: "10000"
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-query-timeout
+
+  NeptuneCluster:
+    Type: AWS::Neptune::DBCluster
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      AvailabilityZones:
+        - !Select [0, !GetAZs ""]
+        - !Select [1, !GetAZs ""]
+      BackupRetentionPeriod: 7
+      CopyTagsToSnapshot: true
+      DBClusterParameterGroupName: !Ref NeptuneClusterParameterGroup
+      DBSubnetGroupName: !Ref NeptuneSubnetGroup
+      DeletionProtection: !If [DeletionProtectionEnabled, true, false]
+      IamAuthEnabled: true
+      Port: 8182
+      StorageEncrypted: true
+      VpcSecurityGroupIds:
+        - !Ref NeptuneSecurityGroup
+      Tags:
+        - Key: Application
+          Value: sol-neptune-mcp
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  NeptuneWriter:
+    Type: AWS::Neptune::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      AllowMajorVersionUpgrade: false
+      AutoMinorVersionUpgrade: true
+      DBClusterIdentifier: !Ref NeptuneCluster
+      DBInstanceClass: db.t4g.medium
+      DBSubnetGroupName: !Ref NeptuneSubnetGroup
+      PubliclyAccessible: false
+      Tags:
+        - Key: Role
+          Value: writer
+
+  ExecutorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Private, IAM-authenticated Neptune Data API executor.
+      CodeUri: .
+      Handler: src/executor/handler.handler
+      MemorySize: 512
+      ReservedConcurrentExecutions: 2
+      Timeout: 15
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref ExecutorSecurityGroup
+        SubnetIds:
+          - !Ref IsolatedSubnetA
+          - !Ref IsolatedSubnetB
+      Environment:
+        Variables:
+          NEPTUNE_ENDPOINT: !GetAtt NeptuneCluster.Endpoint
+          NEPTUNE_PORT: "8182"
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: ExecuteGremlinOnlyOnThisCluster
+              Effect: Allow
+              Action:
+                - neptune-db:ReadDataViaQuery
+                - neptune-db:WriteDataViaQuery
+                - neptune-db:DeleteDataViaQuery
+              Resource: !Sub
+                - arn:${AWS::Partition}:neptune-db:${AWS::Region}:${AWS::AccountId}:${ClusterResourceId}/*
+                - ClusterResourceId: !GetAtt NeptuneCluster.ClusterResourceId
+      Tags:
+        Application: sol-neptune-mcp
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Bundle: true
+        EntryPoints:
+          - src/executor/handler.ts
+        Format: esm
+        Minify: false
+        OutExtension:
+          - .js=.mjs
+        Sourcemap: true
+        Target: node24
+
+  McpFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Public Streamable HTTP MCP resource server; no direct Neptune access.
+      CodeUri: .
+      Handler: src/mcp/handler.handler
+      MemorySize: 512
+      ReservedConcurrentExecutions: 2
+      Timeout: 25
+      Environment:
+        Variables:
+          ALLOWED_SUBJECT: !Ref AllowedSubject
+          CANONICAL_MCP_URL: !Ref CanonicalMcpUrl
+          EXECUTOR_FUNCTION_NAME: !Ref ExecutorFunction
+          MCP_ENABLED: !Ref McpEnabled
+          OAUTH_ISSUER: !Ref OAuthIssuer
+          SERVICE_VERSION: 1.0.0
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: InvokeOnlyPrivateExecutor
+              Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !GetAtt ExecutorFunction.Arn
+      Tags:
+        Application: sol-neptune-mcp
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Bundle: true
+        EntryPoints:
+          - src/mcp/handler.ts
+        Format: esm
+        Minify: false
+        OutExtension:
+          - .js=.mjs
+        Sourcemap: true
+        Target: node24
+
+  McpFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      AuthType: NONE
+      InvokeMode: BUFFERED
+      TargetFunctionArn: !GetAtt McpFunction.Arn
+
+  McpFunctionUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunctionUrl
+      FunctionName: !Ref McpFunction
+      FunctionUrlAuthType: NONE
+      Principal: "*"
+
+  McpFunctionInvokeViaUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref McpFunction
+      InvokedViaFunctionUrl: true
+      Principal: "*"
+
+  McpLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${McpFunction}
+      RetentionInDays: 14
+
+  ExecutorLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ExecutorFunction}
+      RetentionInDays: 14
+
+Outputs:
+  CanonicalMcpUrl:
+    Description: Configure this exact value as the OAuth resource and CanonicalMcpUrl parameter.
+    Value: !Join ["", [!GetAtt McpFunctionUrl.FunctionUrl, mcp]]
+  HealthUrl:
+    Value: !Join ["", [!GetAtt McpFunctionUrl.FunctionUrl, healthz]]
+  ProtectedResourceMetadataUrl:
+    Value: !Join
+      - ""
+      - - !GetAtt McpFunctionUrl.FunctionUrl
+        - .well-known/oauth-protected-resource
+  NeptuneClusterIdentifier:
+    Value: !Ref NeptuneCluster
+  NeptuneWriterIdentifier:
+    Value: !Ref NeptuneWriter
+  NeptuneWriterEndpoint:
+    Description: Private writer endpoint; never expose publicly.
+    Value: !GetAtt NeptuneCluster.Endpoint
+  VpcId:
+    Value: !Ref GraphVpc

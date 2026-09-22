@@ -1,0 +1,9 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "sol-neptune-mcp"
+region = "us-east-1"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+resolve_s3 = true
+parameter_overrides = "McpEnabled=false CanonicalMcpUrl= OAuthIssuer= AllowedSubject= NeptuneParameterGroupFamily=neptune1.4 NeptuneDeletionProtection=false"

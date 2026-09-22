@@ -1,0 +1,12 @@
+.aws-sam/
+.env
+.env.*
+!.env.example
+coverage/
+dist/
+node_modules/
+samconfig.toml
+*.pem
+*.key
+*.token
+*.secret

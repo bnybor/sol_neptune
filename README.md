@@ -1,0 +1,287 @@
+# Sol Neptune Gremlin MCP
+
+This repository implements the approved `sol-neptune-gremlin` version `1.0.0` design. It exposes exactly one OAuth-protected MCP tool, `execute_gremlin`, and forwards the submitted Gremlin string unchanged to a private Amazon Neptune writer.
+
+Neon is not read, written, migrated, synchronized, or reconfigured by this project. Neptune is not declared authoritative.
+
+## What is implemented
+
+```text
+ChatGPT
+   |
+   | HTTPS /mcp + Streamable HTTP + OAuth bearer token
+   v
+Public MCP Lambda Function URL (not in the VPC)
+   |
+   | IAM-authorized Lambda Invoke, maxAttempts=1
+   v
+Private executor Lambda (two isolated VPC subnets)
+   |
+   | HTTPS :8182 + IAM database authentication, maxAttempts=1
+   v
+One encrypted db.t4g.medium Neptune writer; zero readers
+```
+
+The front Lambda uses the official TypeScript MCP SDK's Web-standard Streamable HTTP transport in stateless JSON-response mode. It permits anonymous initialization and tool discovery, but validates OAuth signature, issuer, expiry/not-before, exact audience/resource, `graph:execute` scope, and Robyn's configured immutable provider subject before invocation. The private executor uses `@aws-sdk/client-neptunedata`, untyped GraphSON v3, the writer endpoint, and the Lambda role's temporary AWS credentials.
+
+There is no NAT Gateway, Internet Gateway, public subnet, public Neptune instance, load balancer, API Gateway, EC2 instance, Fargate task, custom domain, or always-on MCP compute.
+
+## Repository layout
+
+- `src/mcp/` — public MCP resource server, OAuth validation, and private Lambda invocation.
+- `src/executor/` — VPC executor and Neptune Data API client.
+- `src/shared/` — response contracts and safe structured logging.
+- `template.yaml` — dedicated SAM/CloudFormation stack.
+- `test/` — protocol, OAuth, executor, logging, and infrastructure tests.
+- `scripts/aws-preflight.sh` — read-only identity, Region, availability, resource, and cost check.
+- `scripts/smoke-test.mjs` — initialization, discovery, OAuth challenge, and optional authenticated read.
+- `scripts/integration-test.mjs` — uniquely identified create/read/delete/deletion-verification test for Neptune only.
+
+## Local prerequisites and verification
+
+Use Node.js 24, npm, AWS SAM CLI, AWS CLI v2, and `jq`. Direct dependency versions and the lockfile are pinned.
+
+```bash
+npm ci
+npm run check
+sam validate --lint --template-file template.yaml
+sam build --template-file template.yaml
+```
+
+`npm run check` runs deterministic formatting verification, lint, strict TypeScript checking, all unit/protocol tests, and both Lambda bundles. It does not contact AWS or execute Gremlin.
+
+## Mandatory deployment gate
+
+Possession of this repository does not authorize deployment, production changes, or AWS charges. Deployment requires Robyn's explicit instruction.
+
+Before any mutating AWS command, run the read-only preflight with an explicitly expected account and Region:
+
+```bash
+./scripts/aws-preflight.sh us-east-1 EXPECTED_12_DIGIT_ACCOUNT_ID
+```
+
+It prints the account ID, caller ARN, selected Region, proposed resources, current default Neptune engine/family, `db.t4g.medium` availability, and the recurring-cost estimate. Stop if either the account or Region is unexpected, if the instance class is unavailable, or if the default engine/family does not support the required TinkerPop behavior. The template deliberately does not pin an engine release, so AWS selects the current supported default; `NeptuneParameterGroupFamily` must be set to its matching family.
+
+Review the current official OpenAI MCP/Auth requirements and the current AWS Neptune/Lambda documentation again immediately before deployment. Stop on any protocol or security conflict.
+
+## Cost estimate
+
+The intended fixed recurring resource is the single Neptune writer. The `us-east-1` public price-file snapshot checked on 2026-09-21 showed:
+
+- `db.t4g.medium`: `$0.093/hour`, approximately `$67.89` for 730 hours.
+- Standard Neptune storage: `$0.10/GB-month`.
+- Backup storage beyond the included allocation: `$0.021/GB-month`.
+- Standard storage I/O: `$0.20` per million requests.
+- Lambda invocations, CloudWatch Logs, snapshots, and data transfer are usage-dependent.
+
+Pricing is not a quote and can change. Recheck the AWS pricing page/calculator before creating the stack. The stack creates no NAT Gateway or load balancer and no other resource expected to exceed `$5/month` on its own under this workload.
+
+## Two-stage fail-closed deployment
+
+The stack name is configurable; commands below use the approved default `sol-neptune-mcp`. Do not put OAuth tokens or provider secrets in `samconfig.toml`, shell history, source control, or CloudFormation parameters.
+
+### Stage 1: infrastructure with MCP disabled
+
+After explicit deployment authorization, build and create a change set without executing it:
+
+```bash
+sam build --template-file template.yaml
+sam deploy \
+  --stack-name sol-neptune-mcp \
+  --region us-east-1 \
+  --capabilities CAPABILITY_IAM \
+  --resolve-s3 \
+  --confirm-changeset \
+  --no-execute-changeset \
+  --parameter-overrides \
+    McpEnabled=false \
+    CanonicalMcpUrl= \
+    OAuthIssuer= \
+    AllowedSubject= \
+    NeptuneParameterGroupFamily=neptune1.4 \
+    NeptuneDeletionProtection=false
+```
+
+Inspect every change-set resource before execution. It must match the inventory in `scripts/aws-preflight.sh`; in particular it must contain one Neptune instance and none of the prohibited network or compute resources. Execute the reviewed change set only after Robyn approves it.
+
+After stage 1 completes, obtain the stable URL:
+
+```bash
+aws cloudformation describe-stacks \
+  --stack-name sol-neptune-mcp \
+  --region us-east-1 \
+  --query 'Stacks[0].Outputs[?OutputKey==`CanonicalMcpUrl`].OutputValue' \
+  --output text
+```
+
+The `/healthz` response is intentionally `ready: false`, and `/mcp` returns service unavailable. The executor has no Function URL and Neptune has no public route.
+
+### Configure Auth0 or another approved established provider
+
+Auth0 is preferred. Use an existing/free approved tenant; do not enable a paid plan without explicit approval. Configure:
+
+1. An API/resource identifier exactly equal to the canonical MCP URL, including `/mcp` and without a trailing slash.
+2. The `graph:execute` permission/scope.
+3. Authorization code flow with PKCE S256.
+4. Provider discovery metadata with the exact issuer, authorization and token endpoints, JWKS URI, an OpenAI-supported client-registration method (prefer CIMD; otherwise DCR or a preconfigured public client), and `S256` in `code_challenge_methods_supported`.
+5. Tokens whose `aud` or `resource` is the exact canonical MCP URL.
+6. Public signup disabled, or provider policy that cannot grant graph access to another user.
+7. Robyn's immutable provider `sub` value as `AllowedSubject`; do not authorize by mutable email address.
+
+No client secret is stored by either Lambda. If the selected provider requires a secret in Lambda or a paid feature, stop and obtain approval rather than improvising a storage service or a different identity design.
+
+### Stage 2: enable OAuth-protected MCP
+
+Create and review a second change set with the exact values:
+
+```bash
+sam deploy \
+  --stack-name sol-neptune-mcp \
+  --region us-east-1 \
+  --capabilities CAPABILITY_IAM \
+  --resolve-s3 \
+  --confirm-changeset \
+  --no-execute-changeset \
+  --parameter-overrides \
+    McpEnabled=true \
+    CanonicalMcpUrl="$MCP_URL" \
+    OAuthIssuer="$OAUTH_ISSUER" \
+    AllowedSubject="$ROBYN_OAUTH_SUBJECT" \
+    NeptuneParameterGroupFamily="$NEPTUNE_PARAMETER_GROUP_FAMILY" \
+    NeptuneDeletionProtection=false
+```
+
+Execute only the reviewed change set. Then verify protected-resource metadata, OAuth provider discovery, and rejection of unauthenticated execution before any mutation.
+
+## Deployment validation
+
+### Static stack and network checks
+
+Run and retain the output:
+
+```bash
+aws cloudformation describe-stack-resources \
+  --stack-name sol-neptune-mcp \
+  --region us-east-1
+
+aws ec2 describe-route-tables \
+  --region us-east-1 \
+  --filters "Name=vpc-id,Values=$VPC_ID"
+
+aws ec2 describe-security-groups \
+  --region us-east-1 \
+  --group-ids "$EXECUTOR_SECURITY_GROUP_ID" "$NEPTUNE_SECURITY_GROUP_ID"
+
+aws lambda get-function-url-config \
+  --region us-east-1 \
+  --function-name "$MCP_FUNCTION_NAME"
+
+# This must return ResourceNotFoundException:
+aws lambda get-function-url-config \
+  --region us-east-1 \
+  --function-name "$EXECUTOR_FUNCTION_NAME"
+```
+
+Confirm that both route tables contain only their VPC-local route, Neptune ingress is only TCP 8182 from the executor security group, and there are no Internet/NAT gateways. Confirm the executor Lambda resource policy is absent and that this stack grants `lambda:InvokeFunction` only to the MCP role.
+
+### MCP protocol and OAuth
+
+```bash
+MCP_URL="$MCP_URL" node scripts/smoke-test.mjs
+
+npx @modelcontextprotocol/inspector@latest
+```
+
+In MCP Inspector, choose Streamable HTTP and enter the exact URL ending in `/mcp`. Verify initialize, initialized notification, `tools/list`, the OAuth challenge, authenticated linking, and the bounded read. Initialization and discovery are anonymous; `tools/call` is not.
+
+To include the authenticated read in the non-interactive smoke test without printing the token:
+
+```bash
+read -rsp 'Short-lived MCP access token: ' MCP_ACCESS_TOKEN
+export MCP_ACCESS_TOKEN MCP_URL
+node scripts/smoke-test.mjs
+unset MCP_ACCESS_TOKEN
+```
+
+### Controlled Neptune-only mutation
+
+Run only after authenticated reads pass and only against this new Neptune cluster:
+
+```bash
+node scripts/integration-test.mjs
+```
+
+The script creates a uniquely named `SolMcpIntegrationTest` vertex, reads exactly that vertex, deletes it, and verifies a zero count. It prints the unique test ID. If it reports `UNKNOWN_MUTATION_OUTCOME`, do not rerun the mutation blindly; use that ID in a bounded read to determine whether the vertex exists, then delete only that vertex.
+
+Never run this mutation against Neon.
+
+### Enable deletion protection after integration
+
+After all integration checks pass, create, review, and execute one final stack update with `NeptuneDeletionProtection=true`. Do not mark deployment complete until this is confirmed by `describe-db-clusters`.
+
+### ChatGPT developer mode
+
+Enable developer mode, add the public MCP URL including `/mcp`, complete OAuth as Robyn, confirm exactly one tool with destructive annotations, and run one bounded read. Record the outcome. Do not claim ChatGPT compatibility from Inspector results alone.
+
+## Error and retry contract
+
+Stable tool error codes are:
+
+- `AUTH_REQUIRED`
+- `AUTH_INVALID`
+- `QUERY_INVALID`
+- `QUERY_TIMEOUT`
+- `RESULT_TOO_LARGE`
+- `NEPTUNE_UNAVAILABLE`
+- `UNKNOWN_MUTATION_OUTCOME`
+- `INTERNAL_ERROR`
+
+Every execution result is marked `retry_safe: false`. Neither the MCP-to-executor invocation nor the Neptune query is retried by the AWS SDK. A connection-level failure clears the cached Neptune client for the next invocation but does not retry the query whose outcome is unknown. Use idempotent Gremlin upserts with stable identifiers when practical.
+
+The maximum query is 65,536 UTF-8 bytes. The structured result envelope is limited to 1 MiB. If execution completed but serialization exceeds the result limit, the result is omitted and `execution_completed: true` is returned so callers do not repeat a possible mutation merely to recover output.
+
+## Logging and monitoring
+
+Application logs contain only request IDs, Lambda request IDs, timings, byte counts, status categories, and sanitized exception class names. Gremlin text, graph results, bearer tokens, authorization headers, AWS credentials, subnet details, and raw exception messages are never intentionally logged. Neptune audit and slow-query exports are not enabled because they could capture query content.
+
+Inspect the two 14-day log groups:
+
+```bash
+aws logs tail "/aws/lambda/$MCP_FUNCTION_NAME" \
+  --region us-east-1 --since 1h --follow
+
+aws logs tail "/aws/lambda/$EXECUTOR_FUNCTION_NAME" \
+  --region us-east-1 --since 1h --follow
+```
+
+Use native Lambda metrics (`Errors`, `Duration`, `Throttles`, `ConcurrentExecutions`) and Neptune metrics such as CPU utilization and request-queue depth. Do not enable query-content logging to troubleshoot.
+
+## Safe rollback
+
+The first response to a problem is a fail-closed configuration update with `McpEnabled=false`. This leaves Neptune and its data intact while `/mcp` becomes unavailable.
+
+For an application rollback, redeploy a previously tested source revision through a reviewed change set. Do not replace the Neptune cluster or change its identifier as part of an application rollback.
+
+Full stack deletion is destructive and is not a routine rollback. Deletion protection intentionally blocks it after integration, and the cluster has `DeletionPolicy: Snapshot` plus `UpdateReplacePolicy: Snapshot`. If Robyn explicitly authorizes decommissioning:
+
+1. Disable MCP.
+2. Confirm no execution is in flight.
+3. Create and verify a named manual cluster snapshot.
+4. Review a change set that disables deletion protection.
+5. Only then delete the stack and verify the retained final snapshot.
+
+Never delete the final or manual snapshots without separate explicit approval.
+
+## Future conversion to Neptune Serverless
+
+The MCP contract, OAuth resource, executor code, and cluster writer endpoint do not change. Following the current Neptune conversion procedure, add a `ServerlessScalingConfiguration`, create a `db.serverless` instance, wait for availability, fail over the cluster writer to it, and remove the provisioned writer only after verification. Perform that as a separately approved infrastructure change with a snapshot and reviewed change set.
+
+## Normative references
+
+- [OpenAI: Build an MCP server](https://developers.openai.com/plugins/build/mcp-server)
+- [OpenAI: MCP authentication](https://developers.openai.com/plugins/build/auth)
+- [OpenAI: Connect and test a plugin](https://developers.openai.com/plugins/deploy/connect-chatgpt)
+- [AWS: Lambda Function URLs](https://docs.aws.amazon.com/lambda/latest/dg/urls-configuration.html)
+- [AWS: Securing Neptune with a VPC](https://docs.aws.amazon.com/neptune/latest/userguide/security-vpc.html)
+- [AWS: Running Gremlin through the AWS SDK](https://docs.aws.amazon.com/neptune/latest/userguide/access-graph-gremlin-sdk.html)
+- [AWS: Converting a Neptune cluster to Serverless](https://docs.aws.amazon.com/neptune/latest/userguide/neptune-serverless-using.html)

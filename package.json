@@ -1,0 +1,40 @@
+{
+  "name": "sol-neptune-gremlin-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "OAuth-protected MCP access to Sol's private Amazon Neptune graph.",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "check": "npm run format:check && npm run lint && npm run typecheck && npm run test && npm run build",
+    "format:check": "prettier --check .",
+    "format:write": "prettier --write .",
+    "lint": "eslint \"src/**/*.ts\" \"test/**/*.ts\" vitest.config.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@aws-sdk/client-lambda": "3.1137.0",
+    "@aws-sdk/client-neptunedata": "3.1137.0",
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "@smithy/node-http-handler": "4.12.1",
+    "jose": "6.2.12",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/aws-lambda": "8.10.163",
+    "@types/node": "26.6.2",
+    "esbuild": "0.28.2",
+    "eslint": "10.0.1",
+    "prettier": "3.9.8",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.70.1",
+    "vitest": "5.0.1",
+    "yaml": "2.9.1"
+  }
+}
