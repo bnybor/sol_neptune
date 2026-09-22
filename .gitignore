@@ -1,4 +1,5 @@
 .aws-sam/
+.tooling/
 .env
 .env.*
 !.env.example

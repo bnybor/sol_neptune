@@ -8,6 +8,20 @@ fi
 
 sol_region=$1
 sol_expected_account=$2
+sol_script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+sol_project_dir=$(cd -- "$sol_script_dir/.." && pwd)
+
+if command -v aws >/dev/null 2>&1; then
+  sol_aws=$(command -v aws)
+elif [[ -x "$sol_project_dir/.tooling/bin/aws" ]]; then
+  sol_aws="$sol_project_dir/.tooling/bin/aws"
+else
+  cat >&2 <<'ERROR'
+AWS CLI v2 was not found on PATH or at .tooling/bin/aws.
+Install it locally with the official AWS installer, then authenticate before retrying.
+ERROR
+  exit 127
+fi
 
 if [[ ! $sol_region =~ ^[a-z]{2}(-gov)?-[a-z]+-[0-9]+$ ]]; then
   echo "Refusing ambiguous Region: $sol_region" >&2
@@ -19,9 +33,15 @@ if [[ ! $sol_expected_account =~ ^[0-9]{12}$ ]]; then
   exit 2
 fi
 
-sol_identity=$(aws sts get-caller-identity --region "$sol_region" --output json)
-sol_account=$(jq -r .Account <<<"$sol_identity")
-sol_arn=$(jq -r .Arn <<<"$sol_identity")
+if ! sol_identity=$("$sol_aws" sts get-caller-identity \
+  --region "$sol_region" \
+  --query '[Account,Arn]' \
+  --output text); then
+  echo "STOP: AWS authentication failed; no deployment is permitted." >&2
+  exit 5
+fi
+
+read -r sol_account sol_arn <<<"$sol_identity"
 
 echo "AWS account ID: $sol_account"
 echo "Caller identity: $sol_arn"
@@ -32,18 +52,19 @@ if [[ $sol_account != "$sol_expected_account" ]]; then
   exit 3
 fi
 
-sol_instance_options=$(aws neptune describe-orderable-db-instance-options \
+sol_instance_option_count=$("$sol_aws" neptune describe-orderable-db-instance-options \
   --region "$sol_region" \
   --engine neptune \
   --db-instance-class db.t4g.medium \
-  --output json)
+  --query 'length(OrderableDBInstanceOptions)' \
+  --output text)
 
-if [[ $(jq '.OrderableDBInstanceOptions | length' <<<"$sol_instance_options") -eq 0 ]]; then
+if [[ $sol_instance_option_count -eq 0 ]]; then
   echo "STOP: db.t4g.medium is not offered for Neptune in $sol_region." >&2
   exit 4
 fi
 
-aws neptune describe-db-engine-versions \
+"$sol_aws" neptune describe-db-engine-versions \
   --region "$sol_region" \
   --engine neptune \
   --default-only \
