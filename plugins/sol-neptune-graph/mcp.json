@@ -1,0 +1,9 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "sol-neptune": {
+      "type": "streamable-http",
+      "url": "https://e5ihe7vc7nrzmzu2rfezzaraja0dzwfv.lambda-url.us-east-1.on.aws/mcp"
+    }
+  }
+}

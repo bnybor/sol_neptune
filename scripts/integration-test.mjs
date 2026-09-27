@@ -12,7 +12,7 @@ if (!mcpUrl?.endsWith("/mcp") || !token) {
 const testId = `sol-mcp-integration-${randomUUID()}`;
 let nextId = 1;
 
-async function execute(query) {
+async function execute(tool, query) {
   const response = await fetch(mcpUrl, {
     method: "POST",
     headers: {
@@ -25,7 +25,7 @@ async function execute(query) {
       jsonrpc: "2.0",
       id: nextId++,
       method: "tools/call",
-      params: { name: "execute_gremlin", arguments: { query } },
+      params: { name: tool, arguments: { query } },
     }),
   });
   const envelope = await response.json();
@@ -46,10 +46,12 @@ function dataArray(result) {
 console.log(`Integration test id: ${testId}`);
 
 await execute(
+  "write_gremlin",
   `g.addV('SolMcpIntegrationTest').property('test_id','${testId}').property('temporary',true).id()`,
 );
 
 const read = await execute(
+  "read_gremlin",
   `g.V().hasLabel('SolMcpIntegrationTest').has('test_id','${testId}').limit(2).elementMap()`,
 );
 if (dataArray(read).length !== 1) {
@@ -59,10 +61,12 @@ if (dataArray(read).length !== 1) {
 }
 
 await execute(
+  "delete_gremlin",
   `g.V().hasLabel('SolMcpIntegrationTest').has('test_id','${testId}').drop().iterate()`,
 );
 
 const verify = await execute(
+  "read_gremlin",
   `g.V().hasLabel('SolMcpIntegrationTest').has('test_id','${testId}').limit(1).count()`,
 );
 const values = dataArray(verify);

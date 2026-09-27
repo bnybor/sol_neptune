@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "sol-neptune": {
+      "type": "http",
+      "url": "https://e5ihe7vc7nrzmzu2rfezzaraja0dzwfv.lambda-url.us-east-1.on.aws/mcp",
+      "oauth_resource": "https://e5ihe7vc7nrzmzu2rfezzaraja0dzwfv.lambda-url.us-east-1.on.aws/mcp"
+    }
+  }
+}

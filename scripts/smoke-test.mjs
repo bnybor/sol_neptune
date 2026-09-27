@@ -23,7 +23,9 @@ async function post(message, accessToken) {
   const text = await response.text();
   return {
     status: response.status,
-    authenticate: response.headers.get("www-authenticate"),
+    authenticate:
+      response.headers.get("www-authenticate") ??
+      response.headers.get("x-amzn-remapped-www-authenticate"),
     body: text ? JSON.parse(text) : undefined,
   };
 }
@@ -54,15 +56,29 @@ const tools = await post({
   params: {},
 });
 const discovered = tools.body?.result?.tools ?? [];
-if (discovered.length !== 1 || discovered[0]?.name !== "execute_gremlin") {
-  throw new Error("Expected exactly the execute_gremlin tool");
+const discoveredByName = new Map(discovered.map((tool) => [tool.name, tool]));
+if (
+  discovered.length !== 4 ||
+  discoveredByName.get("read_gremlin")?.annotations?.readOnlyHint !== true ||
+  discoveredByName.get("read_gremlin")?.annotations?.destructiveHint !==
+    false ||
+  discoveredByName.get("write_gremlin")?.annotations?.readOnlyHint !== false ||
+  discoveredByName.get("write_gremlin")?.annotations?.destructiveHint !==
+    false ||
+  discoveredByName.get("delete_gremlin")?.annotations?.destructiveHint !==
+    true ||
+  discoveredByName.get("get_profile")?._meta?.["openai/profile"] !== true
+) {
+  throw new Error(
+    "Expected the three constrained Gremlin tools and profile tool",
+  );
 }
 
 const anonymous = await post({
   jsonrpc: "2.0",
   id: nextId++,
   method: "tools/call",
-  params: { name: "execute_gremlin", arguments: { query: "g.V().limit(1)" } },
+  params: { name: "read_gremlin", arguments: { query: "g.V().limit(1)" } },
 });
 if (
   !anonymous.authenticate ||
@@ -79,13 +95,29 @@ console.log(
 );
 
 if (token) {
+  const profile = await post(
+    {
+      jsonrpc: "2.0",
+      id: nextId++,
+      method: "tools/call",
+      params: { name: "get_profile", arguments: {} },
+    },
+    token,
+  );
+  if (
+    profile.body?.result?.isError !== false ||
+    typeof profile.body?.result?.structuredContent?.id !== "string"
+  ) {
+    throw new Error("Authenticated profile lookup failed");
+  }
+
   const authenticated = await post(
     {
       jsonrpc: "2.0",
       id: nextId++,
       method: "tools/call",
       params: {
-        name: "execute_gremlin",
+        name: "read_gremlin",
         arguments: { query: "g.V().limit(1).elementMap()" },
       },
     },
@@ -94,6 +126,7 @@ if (token) {
   if (authenticated.body?.result?.structuredContent?.ok !== true) {
     throw new Error("Authenticated bounded read failed");
   }
+  console.log("Authenticated profile lookup passed.");
   console.log("Authenticated bounded read passed.");
 } else {
   console.log("MCP_ACCESS_TOKEN was not set; authenticated read was skipped.");

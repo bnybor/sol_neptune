@@ -1,0 +1,28 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "sol-neptune-graph",
+  "version": "0.2.0+codex.20260926001739",
+  "description": "Authenticated Gremlin access to Sol's private Amazon Neptune graph.",
+  "author": {
+    "name": "Robyn"
+  },
+  "keywords": ["amazon-neptune", "graph", "gremlin", "mcp"],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Sol Neptune Graph",
+        "shortDescription": "Query Sol's private Neptune graph with Gremlin.",
+        "longDescription": "Use OAuth-protected Gremlin tools to inspect and, when explicitly requested, update Sol's private Amazon Neptune graph. Traversals should be bounded and unknown mutation outcomes must never be retried blindly.",
+        "developerName": "Robyn",
+        "category": "Productivity",
+        "capabilities": ["Read", "Write"],
+        "defaultPrompt": [
+          "Count the vertices in Sol's private Neptune graph.",
+          "Run a bounded Gremlin query against Sol's graph.",
+          "Explain the result of a bounded graph traversal."
+        ],
+        "brandColor": "#305CDE"
+      }
+    }
+  }
+}

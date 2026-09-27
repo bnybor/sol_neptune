@@ -103,4 +103,14 @@ describe("OAuth token verification", () => {
       ),
     ).rejects.toBeInstanceOf(TokenValidationError);
   });
+
+  it("classifies a missing required scope for OAuth reauthorization", async () => {
+    await expect(
+      verifyAccessTokenWithKey(
+        await token({ scope: "openid profile" }),
+        config,
+        getKey,
+      ),
+    ).rejects.toMatchObject({ oauthError: "insufficient_scope" });
+  });
 });

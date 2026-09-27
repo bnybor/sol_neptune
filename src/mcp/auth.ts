@@ -17,7 +17,10 @@ type DiscoveryDocument = {
 export type TokenVerifier = (token: string) => Promise<JWTPayload>;
 
 export class TokenValidationError extends Error {
-  public constructor() {
+  public constructor(
+    public readonly oauthError:
+      "invalid_token" | "insufficient_scope" = "invalid_token",
+  ) {
     super("Access token validation failed");
     this.name = "TokenValidationError";
   }
@@ -53,7 +56,7 @@ export function validateTokenClaims(
     ...claimValues(payload.scp),
   ]);
   if (!scopes.has(GRAPH_EXECUTE_SCOPE)) {
-    throw new TokenValidationError();
+    throw new TokenValidationError("insufficient_scope");
   }
 
   if (payload.sub !== config.allowedSubject) {

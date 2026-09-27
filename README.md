@@ -1,6 +1,6 @@
 # Sol Neptune Gremlin MCP
 
-This repository implements the approved `sol-neptune-gremlin` version `1.0.0` design. It exposes exactly one OAuth-protected MCP tool, `execute_gremlin`, and forwards the submitted Gremlin string unchanged to a private Amazon Neptune writer.
+This repository implements the `sol-neptune-gremlin` version `2.0.0` tool surface. It exposes separately constrained OAuth-protected `read_gremlin`, `write_gremlin`, and `delete_gremlin` graph actions. After server-side safety classification, the selected traversal is forwarded unchanged to the existing private Amazon Neptune executor. The authenticated, read-only `get_profile` identity utility remains unchanged and never calls Neptune.
 
 Neon is not read, written, migrated, synchronized, or reconfigured by this project. Neptune is not declared authoritative.
 
@@ -22,19 +22,32 @@ Private executor Lambda (two isolated VPC subnets)
 One encrypted db.t4g.medium Neptune writer; zero readers
 ```
 
-The front Lambda uses the official TypeScript MCP SDK's Web-standard Streamable HTTP transport in stateless JSON-response mode. It permits anonymous initialization and tool discovery, but validates OAuth signature, issuer, expiry/not-before, exact audience/resource, `graph:execute` scope, and Robyn's configured immutable provider subject before invocation. The private executor uses `@aws-sdk/client-neptunedata`, untyped GraphSON v3, the writer endpoint, and the Lambda role's temporary AWS credentials.
+The front Lambda uses the official TypeScript MCP SDK's Web-standard Streamable HTTP transport in stateless JSON-response mode. It permits anonymous initialization and tool discovery, but validates OAuth signature, issuer, expiry/not-before, exact audience/resource, `graph:execute` scope, and Robyn's configured immutable provider subject before invocation. `get_profile` returns only a deterministic opaque identifier and a generic display label; it does not reveal the provider subject, email address, or token. The private executor uses `@aws-sdk/client-neptunedata`, untyped GraphSON v3, the writer endpoint, and the Lambda role's temporary AWS credentials.
 
 There is no NAT Gateway, Internet Gateway, public subnet, public Neptune instance, load balancer, API Gateway, EC2 instance, Fargate task, custom domain, or always-on MCP compute.
+
+## Tool safety boundary
+
+The public MCP Lambda classifies each submitted Gremlin-Groovy traversal before invoking the private executor:
+
+- `read_gremlin` accepts only traversals classified as read-only.
+- `write_gremlin` requires a recognized add/update step (`addV`, `addE`, `mergeV`, `mergeE`, or `property`) and rejects `drop`.
+- `delete_gremlin` requires a recognized `drop` removal step.
+
+The classifier is deliberately deny-by-default. It tokenizes the full traversal, including nested anonymous traversals, while ignoring quoted string contents and comments. It rejects unknown calls and dynamic Groovy features such as statements, assignments, closures, interpolated method names, bracket dispatch, reflection-style invocation, and unsupported syntax. This is a conservative traversal subset rather than a complete Gremlin-Groovy parser: a safe but unsupported query is rejected with `QUERY_INVALID` and must be reformulated or added to the allowlist with tests. A rejected traversal must never be moved to another tool merely to bypass the classifier.
+
+The private executor, OAuth scope and subject checks, request IDs, GraphSON handling, result limits, and no-retry behavior are shared by all three graph tools. In particular, an ambiguous invocation failure continues to return `UNKNOWN_MUTATION_OUTCOME` and the caller must not retry blindly.
 
 ## Repository layout
 
 - `src/mcp/` — public MCP resource server, OAuth validation, and private Lambda invocation.
+- `src/mcp/gremlin-safety.ts` — conservative deny-by-default traversal classifier and tool-boundary enforcement.
 - `src/executor/` — VPC executor and Neptune Data API client.
 - `src/shared/` — response contracts and safe structured logging.
 - `template.yaml` — dedicated SAM/CloudFormation stack.
 - `test/` — protocol, OAuth, executor, logging, and infrastructure tests.
 - `scripts/aws-preflight.sh` — read-only identity, Region, availability, resource, and cost check.
-- `scripts/smoke-test.mjs` — initialization, discovery, OAuth challenge, and optional authenticated read.
+- `scripts/smoke-test.mjs` — initialization, discovery, OAuth challenge, and optional authenticated profile plus bounded read.
 - `scripts/integration-test.mjs` — uniquely identified create/read/delete/deletion-verification test for Neptune only.
 
 ## Local prerequisites and verification
@@ -130,6 +143,22 @@ Auth0 is preferred. Use an existing/free approved tenant; do not enable a paid p
 6. Public signup disabled, or provider policy that cannot grant graph access to another user.
 7. Robyn's immutable provider `sub` value as `AllowedSubject`; do not authorize by mutable email address.
 
+When Auth0 uses Client ID Metadata Documents (CIMD), register every OpenAI
+client metadata URI used by the intended surface. ChatGPT web uses
+`https://chatgpt.com/oauth/client.json`, while Codex in the desktop app uses
+`https://chatgpt.com/oauth/codex/client.json`. For each Auth0-generated client,
+create a user-subject client grant for the canonical MCP audience with the
+`graph:execute` scope. A default client-subject grant is for machine-to-machine
+authorization and causes the interactive connection to fail even when the CIMD
+client itself is registered correctly.
+
+Auth0 treats these CIMD registrations as third-party applications and ignores
+scopes that a Post Login Action tries to add to their access tokens. Do not use
+an Action to force `graph:execute`. When a correctly signed and resource-bound
+token lacks that scope, the MCP tool returns an OAuth challenge containing
+`error="insufficient_scope"` and `scope="graph:execute"`; ChatGPT can then
+reauthorize the account and request the missing permission explicitly.
+
 No client secret is stored by either Lambda. If the selected provider requires a secret in Lambda or a paid feature, stop and obtain approval rather than improvising a storage service or a different identity design.
 
 ### Stage 2: enable OAuth-protected MCP
@@ -224,7 +253,30 @@ After all integration checks pass, create, review, and execute one final stack u
 
 ### ChatGPT developer mode
 
-Enable developer mode, add the public MCP URL including `/mcp`, complete OAuth as Robyn, confirm exactly one tool with destructive annotations, and run one bounded read. Record the outcome. Do not claim ChatGPT compatibility from Inspector results alone.
+This repository includes the portable ChatGPT/Codex plugin package at
+`plugins/sol-neptune-graph`. The package contains its plugin manifest, direct
+Streamable HTTP MCP configuration, OpenAI compatibility manifest, and a safety
+skill for bounded Gremlin work. The repo marketplace is
+`.agents/plugins/marketplace.json`.
+
+For local ChatGPT testing:
+
+1. Enable ChatGPT Developer mode.
+2. In ChatGPT Plugins, create a connection named `Sol Neptune Graph` with the
+   public MCP URL including `/mcp` and complete OAuth as Robyn.
+3. Record the connection's non-secret technical ID from the browser URL and map
+   it in `plugins/sol-neptune-graph/.app.json`.
+4. Install or refresh `sol-neptune-graph@sol-neptune-local` from the repo
+   marketplace, then start a new chat with the plugin enabled.
+5. Confirm the three graph tools and their exact annotations: read-only and
+   non-destructive for `read_gremlin`, non-read-only and non-destructive for
+   `write_gremlin`, and non-read-only and destructive for `delete_gremlin`.
+   Confirm the unchanged read-only `get_profile` identity utility and run one
+   bounded read. Record the outcome.
+
+Do not claim ChatGPT compatibility from Inspector or endpoint tests alone. See
+`plugins/sol-neptune-graph/README.md` for package-specific validation and
+installation details.
 
 ## Error and retry contract
 
@@ -265,6 +317,8 @@ The first response to a problem is a fail-closed configuration update with `McpE
 
 For an application rollback, redeploy a previously tested source revision through a reviewed change set. Do not replace the Neptune cluster or change its identifier as part of an application rollback.
 
+The current SAM template does not create Lambda aliases or publish immutable versions, and the Function URL targets the unqualified MCP function. Therefore a published version alone cannot redirect the existing URL. Before updating production, retain the current Lambda deployment package and its `CodeSha256`, plus the current CloudFormation template and parameters. The preferred rollback is a reviewed SAM/CloudFormation deployment of the retained prior source revision. A direct `update-function-code` using the retained package is emergency-only because it creates CloudFormation drift; follow it with a reviewed stack reconciliation.
+
 Full stack deletion is destructive and is not a routine rollback. Deletion protection intentionally blocks it after integration, and the cluster has `DeletionPolicy: Snapshot` plus `UpdateReplacePolicy: Snapshot`. If Robyn explicitly authorizes decommissioning:
 
 1. Disable MCP.
@@ -287,4 +341,6 @@ The MCP contract, OAuth resource, executor code, and cluster writer endpoint do 
 - [AWS: Lambda Function URLs](https://docs.aws.amazon.com/lambda/latest/dg/urls-configuration.html)
 - [AWS: Securing Neptune with a VPC](https://docs.aws.amazon.com/neptune/latest/userguide/security-vpc.html)
 - [AWS: Running Gremlin through the AWS SDK](https://docs.aws.amazon.com/neptune/latest/userguide/access-graph-gremlin-sdk.html)
+- [AWS: Native Gremlin step support](https://docs.aws.amazon.com/neptune/latest/userguide/gremlin-step-support.html)
+- [Apache TinkerPop: Gremlin language reference](https://tinkerpop.apache.org/docs/current/reference/)
 - [AWS: Converting a Neptune cluster to Serverless](https://docs.aws.amazon.com/neptune/latest/userguide/neptune-serverless-using.html)

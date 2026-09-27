@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import {
@@ -20,16 +20,24 @@ import {
   sanitizedErrorClass,
   type SafeLogger,
 } from "../shared/logging.js";
-import { extractBearerToken, type TokenVerifier } from "./auth.js";
+import {
+  extractBearerToken,
+  TokenValidationError,
+  type TokenVerifier,
+} from "./auth.js";
 import type { McpConfig } from "./config.js";
 import { protectedResourceMetadataUrl } from "./config.js";
 import {
   ExecutorInvocationError,
   type ExecutorInvoker,
 } from "./executor-invoker.js";
+import {
+  validateGremlinForTool,
+  type GremlinToolMode,
+} from "./gremlin-safety.js";
 
 export const SERVER_INSTRUCTIONS =
-  "This server exposes Sol's private structural graph through Gremlin. Bound potentially large traversals. Operations may mutate data. Never retry an unknown mutation outcome blindly.";
+  "This server exposes Sol's private structural graph through separate read, non-destructive write, and destructive-delete Gremlin tools. Use read_gremlin for bounded reads, write_gremlin only for explicitly requested additions or updates, and delete_gremlin only for explicitly requested removals. Never retry an unknown mutation outcome blindly.";
 
 const queryInput = z
   .object({
@@ -37,37 +45,79 @@ const queryInput = z
   })
   .strict();
 
+const profileInput = z.object({}).strict();
+
 const securitySchemes = [
   { type: "oauth2", scopes: [GRAPH_EXECUTE_SCOPE] },
 ] as const;
 
-export const executeGremlinTool = {
-  name: "execute_gremlin",
-  title: "Execute Gremlin",
+const gremlinInputSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["query"],
+  properties: {
+    query: {
+      type: "string",
+      minLength: 1,
+      maxLength: 65_536,
+      description:
+        "A Gremlin traversal to execute against Sol's Neptune graph.",
+    },
+  },
+} as const;
+
+const gremlinOutputSchema = {
+  type: "object",
+  additionalProperties: true,
+  required: ["ok"],
+  properties: {
+    ok: { type: "boolean" },
+  },
+} as const;
+
+export const readGremlinTool = {
+  name: "read_gremlin",
+  title: "Read Gremlin",
   description:
-    "Execute a Gremlin query or mutation against Sol's private Neptune graph.",
-  inputSchema: {
-    type: "object",
-    additionalProperties: false,
-    required: ["query"],
-    properties: {
-      query: {
-        type: "string",
-        minLength: 1,
-        maxLength: 65_536,
-        description:
-          "A Gremlin query or mutation to execute against Sol's Neptune graph.",
-      },
-    },
+    "Use this for bounded, read-only Gremlin traversals against Sol's private Neptune graph. This action cannot mutate the graph: the server rejects every traversal it cannot verify as non-mutating.",
+  inputSchema: gremlinInputSchema,
+  outputSchema: gremlinOutputSchema,
+  annotations: {
+    readOnlyHint: true,
+    destructiveHint: false,
+    openWorldHint: false,
   },
-  outputSchema: {
-    type: "object",
-    additionalProperties: true,
-    required: ["ok"],
-    properties: {
-      ok: { type: "boolean" },
-    },
+  securitySchemes,
+  _meta: {
+    securitySchemes,
   },
+} as const;
+
+export const writeGremlinTool = {
+  name: "write_gremlin",
+  title: "Write Gremlin",
+  description:
+    "Use this only for explicitly requested Gremlin mutations that add or update vertices, edges, or properties in Sol's private Neptune graph. The server rejects removals and every traversal it cannot verify as an allowed non-destructive mutation.",
+  inputSchema: gremlinInputSchema,
+  outputSchema: gremlinOutputSchema,
+  annotations: {
+    readOnlyHint: false,
+    destructiveHint: false,
+    openWorldHint: false,
+  },
+  securitySchemes,
+  _meta: {
+    securitySchemes,
+  },
+} as const;
+
+export const deleteGremlinTool = {
+  name: "delete_gremlin",
+  title: "Delete with Gremlin",
+  description:
+    "Use this only for explicitly requested destructive Gremlin mutations that remove vertices, edges, or properties from Sol's private Neptune graph. The server requires a recognized removal step and rejects every traversal it cannot classify safely.",
+  inputSchema: gremlinInputSchema,
+  outputSchema: gremlinOutputSchema,
   annotations: {
     readOnlyHint: false,
     destructiveHint: true,
@@ -76,6 +126,49 @@ export const executeGremlinTool = {
   securitySchemes,
   _meta: {
     securitySchemes,
+  },
+} as const;
+
+export const getProfileTool = {
+  name: "get_profile",
+  title: "Get connected profile",
+  description:
+    "Return the stable opaque profile represented by the authenticated connection.",
+  inputSchema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {},
+  },
+  outputSchema: {
+    $schema: "https://json-schema.org/draft/2020-12/schema",
+    type: "object",
+    additionalProperties: false,
+    required: ["id"],
+    properties: {
+      id: {
+        type: "string",
+        minLength: 1,
+        pattern: "\\S",
+        description:
+          "Opaque profile identifier that remains stable across reconnections.",
+      },
+      name: { type: "string", description: "Profile display name." },
+      email: { type: "string", description: "Profile display email." },
+      nickname: {
+        type: "string",
+        description: "Label for distinguishing this connected profile.",
+      },
+    },
+  },
+  annotations: {
+    readOnlyHint: true,
+    destructiveHint: false,
+    openWorldHint: false,
+  },
+  securitySchemes,
+  _meta: {
+    securitySchemes,
+    "openai/profile": true,
   },
 } as const;
 
@@ -109,7 +202,20 @@ function challengeFor(
   config: McpConfig,
   error: "invalid_token" | "insufficient_scope",
 ): string {
-  return `Bearer resource_metadata="${protectedResourceMetadataUrl(config)}", scope="${GRAPH_EXECUTE_SCOPE}", error="${error}", error_description="Authentication is required to execute Gremlin"`;
+  return `Bearer resource_metadata="${protectedResourceMetadataUrl(config)}", scope="${GRAPH_EXECUTE_SCOPE}", error="${error}", error_description="Authentication is required to access the private MCP tools"`;
+}
+
+function profileResult(subject: string): CallToolResult {
+  const id = `sol_${createHash("sha256")
+    .update("sol-neptune-profile\0", "utf8")
+    .update(subject, "utf8")
+    .digest("base64url")}`;
+  const profile = { id, nickname: "Sol Neptune owner" };
+  return {
+    content: [{ type: "text", text: JSON.stringify(profile) }],
+    structuredContent: profile,
+    isError: false,
+  };
 }
 
 function asToolResult(response: ExecutionResponse): CallToolResult {
@@ -122,6 +228,29 @@ function asToolResult(response: ExecutionResponse): CallToolResult {
     structuredContent: response,
     isError: false,
   };
+}
+
+function gremlinToolMode(name: string): GremlinToolMode | undefined {
+  if (name === readGremlinTool.name) return "read";
+  if (name === writeGremlinTool.name) return "write";
+  if (name === deleteGremlinTool.name) return "delete";
+  return undefined;
+}
+
+function invalidGremlinMessage(
+  mode: GremlinToolMode,
+  unsupportedSyntax: boolean,
+): string {
+  if (unsupportedSyntax) {
+    return "The Gremlin traversal uses syntax or steps that the server cannot classify safely.";
+  }
+  if (mode === "read") {
+    return "The read_gremlin tool only accepts traversals verified as read-only.";
+  }
+  if (mode === "write") {
+    return "The write_gremlin tool only accepts verified add or update traversals and rejects reads and removals.";
+  }
+  return "The delete_gremlin tool only accepts verified traversals containing a removal step.";
 }
 
 // The low-level SDK Server is intentionally used for this advanced case because
@@ -144,12 +273,20 @@ export function createMcpServer(dependencies: ServerDependencies): Server {
   server.setRequestHandler(ListToolsRequestSchema, () => ({
     // The current SDK transport permits OpenAI's securitySchemes extension even
     // though its published TypeScript Tool type has not yet added that field.
-    tools: [executeGremlinTool],
+    tools: [
+      readGremlinTool,
+      writeGremlinTool,
+      deleteGremlinTool,
+      getProfileTool,
+    ],
   }));
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const requestId = randomUUID();
-    if (request.params.name !== executeGremlinTool.name) {
+    const mode = gremlinToolMode(request.params.name);
+    const isGremlin = mode !== undefined;
+    const isProfile = request.params.name === getProfileTool.name;
+    if (!isGremlin && !isProfile) {
       return errorToolResult(
         failure(
           "QUERY_INVALID",
@@ -159,17 +296,27 @@ export function createMcpServer(dependencies: ServerDependencies): Server {
       );
     }
 
-    const input = queryInput.safeParse(request.params.arguments);
-    if (
-      !input.success ||
-      Buffer.byteLength(input.data.query, "utf8") > MAX_QUERY_BYTES
+    let query: string | undefined;
+    if (isGremlin) {
+      const input = queryInput.safeParse(request.params.arguments);
+      if (
+        !input.success ||
+        Buffer.byteLength(input.data.query, "utf8") > MAX_QUERY_BYTES
+      ) {
+        return errorToolResult(
+          failure(
+            "QUERY_INVALID",
+            "The Gremlin query input is invalid.",
+            requestId,
+          ),
+        );
+      }
+      query = input.data.query;
+    } else if (
+      !profileInput.safeParse(request.params.arguments ?? {}).success
     ) {
       return errorToolResult(
-        failure(
-          "QUERY_INVALID",
-          "The Gremlin query input is invalid.",
-          requestId,
-        ),
+        failure("QUERY_INVALID", "The profile input is invalid.", requestId),
       );
     }
 
@@ -187,10 +334,19 @@ export function createMcpServer(dependencies: ServerDependencies): Server {
       );
     }
 
+    let subject: string;
     try {
-      await dependencies.tokenVerifier(token);
-    } catch {
-      const challenge = challengeFor(dependencies.config, "invalid_token");
+      const payload = await dependencies.tokenVerifier(token);
+      if (typeof payload.sub !== "string" || payload.sub.length === 0) {
+        throw new TokenValidationError();
+      }
+      subject = payload.sub;
+    } catch (error) {
+      const oauthError =
+        error instanceof TokenValidationError
+          ? error.oauthError
+          : "invalid_token";
+      const challenge = challengeFor(dependencies.config, oauthError);
       dependencies.onAuthChallenge?.(challenge);
       return errorToolResult(
         failure(
@@ -202,11 +358,32 @@ export function createMcpServer(dependencies: ServerDependencies): Server {
       );
     }
 
-    try {
-      const response = await dependencies.invokeExecutor(
-        input.data.query,
-        requestId,
+    if (isProfile) {
+      return profileResult(subject);
+    }
+
+    if (query === undefined || mode === undefined) {
+      return errorToolResult(
+        failure("QUERY_INVALID", "The Gremlin query is missing.", requestId),
       );
+    }
+
+    const validation = validateGremlinForTool(query, mode);
+    if (!validation.ok) {
+      return errorToolResult(
+        failure(
+          "QUERY_INVALID",
+          invalidGremlinMessage(
+            mode,
+            validation.reason === "unsupported_syntax",
+          ),
+          requestId,
+        ),
+      );
+    }
+
+    try {
+      const response = await dependencies.invokeExecutor(query, requestId);
       return asToolResult(response);
     } catch (error) {
       const response = failure(

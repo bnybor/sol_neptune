@@ -1,5 +1,7 @@
 import type { ExecutionResponse } from "../src/shared/contracts.js";
+import { TokenValidationError } from "../src/mcp/auth.js";
 import type { McpConfig } from "../src/mcp/config.js";
+import { ExecutorInvocationError } from "../src/mcp/executor-invoker.js";
 import { createHandler } from "../src/mcp/handler.js";
 import {
   functionUrlEvent,
@@ -46,7 +48,7 @@ describe("MCP Lambda handler", () => {
     expect(result.instructions).toContain("unknown mutation outcome");
   });
 
-  it("lists exactly one tool with the exact schema, OAuth scheme, and annotations", async () => {
+  it("lists separately constrained graph tools plus the profile tool", async () => {
     const handler = createHandler({ config });
     const response = await handler(
       functionUrlEvent("/mcp", { body: jsonRpcRequest("tools/list", {}) }),
@@ -55,9 +57,18 @@ describe("MCP Lambda handler", () => {
     const result = resultOf(parseResponseBody(response.body));
     const tools = result.tools as Record<string, unknown>[];
 
-    expect(tools).toHaveLength(1);
-    expect(tools[0]).toMatchObject({
-      name: "execute_gremlin",
+    expect(tools).toHaveLength(4);
+    const readTool = tools.find((tool) => tool.name === "read_gremlin");
+    const writeTool = tools.find((tool) => tool.name === "write_gremlin");
+    const deleteTool = tools.find((tool) => tool.name === "delete_gremlin");
+    const profileTool = tools.find((tool) => tool.name === "get_profile");
+    expect(readTool?.description).toContain("cannot mutate the graph");
+    expect(writeTool?.description).toContain("rejects removals");
+    expect(deleteTool?.description).toContain(
+      "remove vertices, edges, or properties",
+    );
+    expect(readTool).toMatchObject({
+      name: "read_gremlin",
       inputSchema: {
         type: "object",
         additionalProperties: false,
@@ -67,12 +78,85 @@ describe("MCP Lambda handler", () => {
         },
       },
       annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        openWorldHint: false,
+      },
+      securitySchemes: [{ type: "oauth2", scopes: ["graph:execute"] }],
+    });
+    expect(writeTool).toMatchObject({
+      name: "write_gremlin",
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        openWorldHint: false,
+      },
+      securitySchemes: [{ type: "oauth2", scopes: ["graph:execute"] }],
+    });
+    expect(deleteTool).toMatchObject({
+      name: "delete_gremlin",
+      annotations: {
         readOnlyHint: false,
         destructiveHint: true,
         openWorldHint: false,
       },
       securitySchemes: [{ type: "oauth2", scopes: ["graph:execute"] }],
     });
+    expect(profileTool).toMatchObject({
+      name: "get_profile",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {},
+      },
+      outputSchema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["id"],
+      },
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        openWorldHint: false,
+      },
+      securitySchemes: [{ type: "oauth2", scopes: ["graph:execute"] }],
+      _meta: { "openai/profile": true },
+    });
+  });
+
+  it("returns a stable opaque profile without invoking Neptune", async () => {
+    const invokeExecutor = vi.fn();
+    const handler = createHandler({
+      config,
+      invokeExecutor,
+      tokenVerifier: vi.fn().mockResolvedValue({ sub: config.allowedSubject }),
+    });
+    const callProfile = () =>
+      handler(
+        functionUrlEvent("/mcp", {
+          authorization: "Bearer valid-token",
+          body: jsonRpcRequest("tools/call", {
+            name: "get_profile",
+            arguments: {},
+          }),
+        }),
+        context,
+      );
+
+    const first = resultOf(parseResponseBody((await callProfile()).body));
+    const second = resultOf(parseResponseBody((await callProfile()).body));
+    const firstProfile = first.structuredContent as Record<string, unknown>;
+    const secondProfile = second.structuredContent as Record<string, unknown>;
+
+    expect(first.isError).toBe(false);
+    expect(firstProfile.id).toEqual(secondProfile.id);
+    expect(firstProfile.id).not.toBe(config.allowedSubject);
+    expect(firstProfile.id).toMatch(/^sol_[A-Za-z0-9_-]+$/u);
+    expect(firstProfile).toEqual({
+      id: firstProfile.id,
+      nickname: "Sol Neptune owner",
+    });
+    expect(invokeExecutor).not.toHaveBeenCalled();
   });
 
   it("rejects a missing token with both OAuth challenge mechanisms", async () => {
@@ -80,7 +164,7 @@ describe("MCP Lambda handler", () => {
     const response = await handler(
       functionUrlEvent("/mcp", {
         body: jsonRpcRequest("tools/call", {
-          name: "execute_gremlin",
+          name: "read_gremlin",
           arguments: { query: "g.V().limit(1)" },
         }),
       }),
@@ -109,7 +193,7 @@ describe("MCP Lambda handler", () => {
       functionUrlEvent("/mcp", {
         authorization: "Bearer invalid-token",
         body: jsonRpcRequest("tools/call", {
-          name: "execute_gremlin",
+          name: "read_gremlin",
           arguments: { query: "g.V()" },
         }),
       }),
@@ -120,6 +204,38 @@ describe("MCP Lambda handler", () => {
 
     expect((structured.error as Record<string, unknown>).code).toBe(
       "AUTH_INVALID",
+    );
+    expect(invokeExecutor).not.toHaveBeenCalled();
+  });
+
+  it("requests reauthorization when the token lacks the required scope", async () => {
+    const invokeExecutor = vi.fn();
+    const handler = createHandler({
+      config,
+      invokeExecutor,
+      tokenVerifier: vi
+        .fn()
+        .mockRejectedValue(new TokenValidationError("insufficient_scope")),
+    });
+    const response = await handler(
+      functionUrlEvent("/mcp", {
+        authorization: "Bearer valid-token-without-scope",
+        body: jsonRpcRequest("tools/call", {
+          name: "read_gremlin",
+          arguments: { query: "g.V().limit(1)" },
+        }),
+      }),
+      context,
+    );
+    const result = resultOf(parseResponseBody(response.body));
+    const meta = result._meta as Record<string, unknown>;
+    const challenges = meta["mcp/www_authenticate"] as string[];
+
+    expect(challenges).toHaveLength(1);
+    expect(challenges[0]).toContain('scope="graph:execute"');
+    expect(challenges[0]).toContain('error="insufficient_scope"');
+    expect(response.headers?.["www-authenticate"]).toContain(
+      'error="insufficient_scope"',
     );
     expect(invokeExecutor).not.toHaveBeenCalled();
   });
@@ -135,7 +251,7 @@ describe("MCP Lambda handler", () => {
       functionUrlEvent("/mcp", {
         authorization: "Bearer valid-token",
         body: jsonRpcRequest("tools/call", {
-          name: "execute_gremlin",
+          name: "read_gremlin",
           arguments: { query: "é".repeat(32_769) },
         }),
       }),
@@ -171,7 +287,7 @@ describe("MCP Lambda handler", () => {
       functionUrlEvent("/mcp", {
         authorization: "Bearer valid-token",
         body: jsonRpcRequest("tools/call", {
-          name: "execute_gremlin",
+          name: "read_gremlin",
           arguments: { query: "g.V().limit(1)" },
         }),
       }),
@@ -187,6 +303,144 @@ describe("MCP Lambda handler", () => {
       "g.V().limit(1)",
       expect.any(String),
     );
+  });
+
+  it("forwards verified add/update and delete traversals unchanged", async () => {
+    const execution: ExecutionResponse = {
+      ok: true,
+      result: { data: [] },
+      meta: {
+        request_id: "opaque",
+        elapsed_ms: 1,
+        result_bytes: 11,
+        retry_safe: false,
+      },
+    };
+    const invokeExecutor = vi.fn().mockResolvedValue(execution);
+    const handler = createHandler({
+      config,
+      invokeExecutor,
+      tokenVerifier: vi.fn().mockResolvedValue({ sub: config.allowedSubject }),
+    });
+
+    for (const [name, query] of [
+      ["write_gremlin", "g.V('v1').property(single,'name','Ada')"],
+      ["delete_gremlin", "g.V('v1').properties('obsolete').drop().iterate()"],
+    ] as const) {
+      const response = await handler(
+        functionUrlEvent("/mcp", {
+          authorization: "Bearer valid-token",
+          body: jsonRpcRequest("tools/call", {
+            name,
+            arguments: { query },
+          }),
+        }),
+        context,
+      );
+      const result = resultOf(parseResponseBody(response.body));
+      expect(result.structuredContent).toEqual(execution);
+      expect(invokeExecutor).toHaveBeenCalledWith(query, expect.any(String));
+    }
+  });
+
+  it.each([
+    ["read_gremlin", "g.V().coalesce(__.values('name'),__.addV('person'))"],
+    [
+      "write_gremlin",
+      "g.V('v1').property('name','Ada').sideEffect(__.properties('obsolete').drop())",
+    ],
+    ["read_gremlin", "g.V().limit(1"],
+  ])(
+    "rejects unsafe or malformed input for %s before invocation",
+    async (name, query) => {
+      const invokeExecutor = vi.fn();
+      const handler = createHandler({
+        config,
+        invokeExecutor,
+        tokenVerifier: vi
+          .fn()
+          .mockResolvedValue({ sub: config.allowedSubject }),
+      });
+      const response = await handler(
+        functionUrlEvent("/mcp", {
+          authorization: "Bearer valid-token",
+          body: jsonRpcRequest("tools/call", {
+            name,
+            arguments: { query },
+          }),
+        }),
+        context,
+      );
+      const result = resultOf(parseResponseBody(response.body));
+      const structured = result.structuredContent as Record<string, unknown>;
+      const error = structured.error as Record<string, unknown>;
+
+      expect(error.code).toBe("QUERY_INVALID");
+      expect(error.request_id).toEqual(expect.any(String));
+      expect(error.retry_safe).toBe(false);
+      expect(invokeExecutor).not.toHaveBeenCalled();
+    },
+  );
+
+  it("preserves the unknown mutation outcome warning after ambiguous executor failure", async () => {
+    const invokeExecutor = vi
+      .fn()
+      .mockRejectedValue(new ExecutorInvocationError(false));
+    const handler = createHandler({
+      config,
+      invokeExecutor,
+      tokenVerifier: vi.fn().mockResolvedValue({ sub: config.allowedSubject }),
+    });
+    const response = await handler(
+      functionUrlEvent("/mcp", {
+        authorization: "Bearer valid-token",
+        body: jsonRpcRequest("tools/call", {
+          name: "write_gremlin",
+          arguments: { query: "g.addV('person')" },
+        }),
+      }),
+      context,
+    );
+    const result = resultOf(parseResponseBody(response.body));
+    const structured = result.structuredContent as Record<string, unknown>;
+    const error = structured.error as Record<string, unknown>;
+
+    expect(error).toMatchObject({
+      code: "UNKNOWN_MUTATION_OUTCOME",
+      retry_safe: false,
+    });
+    expect(error.message).toContain("do not retry blindly");
+    expect(invokeExecutor).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps definitely-not-invoked executor failures retry-distinct", async () => {
+    const invokeExecutor = vi
+      .fn()
+      .mockRejectedValue(new ExecutorInvocationError(true));
+    const handler = createHandler({
+      config,
+      invokeExecutor,
+      tokenVerifier: vi.fn().mockResolvedValue({ sub: config.allowedSubject }),
+    });
+    const response = await handler(
+      functionUrlEvent("/mcp", {
+        authorization: "Bearer valid-token",
+        body: jsonRpcRequest("tools/call", {
+          name: "read_gremlin",
+          arguments: { query: "g.V().limit(1)" },
+        }),
+      }),
+      context,
+    );
+    const result = resultOf(parseResponseBody(response.body));
+    const structured = result.structuredContent as Record<string, unknown>;
+    const error = structured.error as Record<string, unknown>;
+
+    expect(error).toMatchObject({
+      code: "NEPTUNE_UNAVAILABLE",
+      retry_safe: false,
+    });
+    expect(error.message).toBe("The private executor is unavailable.");
   });
 
   it("publishes protected-resource metadata and reports readiness without secrets", async () => {
