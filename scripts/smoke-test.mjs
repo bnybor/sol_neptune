@@ -58,7 +58,7 @@ const tools = await post({
 const discovered = tools.body?.result?.tools ?? [];
 const discoveredByName = new Map(discovered.map((tool) => [tool.name, tool]));
 if (
-  discovered.length !== 4 ||
+  discovered.length !== 7 ||
   discoveredByName.get("read_gremlin")?.annotations?.readOnlyHint !== true ||
   discoveredByName.get("read_gremlin")?.annotations?.destructiveHint !==
     false ||
@@ -67,10 +67,17 @@ if (
     false ||
   discoveredByName.get("delete_gremlin")?.annotations?.destructiveHint !==
     true ||
-  discoveredByName.get("get_profile")?._meta?.["openai/profile"] !== true
+  discoveredByName.get("get_profile")?._meta?.["openai/profile"] !== true ||
+  discoveredByName.get("get_graph_state")?.annotations?.readOnlyHint !== true ||
+  discoveredByName.get("commit_semantic_delta")?.annotations
+    ?.destructiveHint !== false ||
+  discoveredByName.get("commit_semantic_delta")?.annotations?.idempotentHint !==
+    true ||
+  discoveredByName.get("reconcile_operation")?.annotations?.idempotentHint !==
+    true
 ) {
   throw new Error(
-    "Expected the three constrained Gremlin tools and profile tool",
+    "Expected the four existing tools and three typed semantic tools",
   );
 }
 
@@ -95,6 +102,27 @@ console.log(
 );
 
 if (token) {
+  const graphState = await post(
+    {
+      jsonrpc: "2.0",
+      id: nextId++,
+      method: "tools/call",
+      params: {
+        name: "get_graph_state",
+        arguments: { include_allocators: true, include_v1_state: false },
+      },
+    },
+    token,
+  );
+  if (
+    graphState.body?.result?.isError !== false ||
+    graphState.body?.result?.structuredContent?.primary_store !== "neptune" ||
+    typeof graphState.body?.result?.structuredContent?.semantic_revision !==
+      "number"
+  ) {
+    throw new Error("Authenticated graph-state lookup failed");
+  }
+
   const profile = await post(
     {
       jsonrpc: "2.0",
@@ -126,6 +154,7 @@ if (token) {
   if (authenticated.body?.result?.structuredContent?.ok !== true) {
     throw new Error("Authenticated bounded read failed");
   }
+  console.log("Authenticated graph-state lookup passed.");
   console.log("Authenticated profile lookup passed.");
   console.log("Authenticated bounded read passed.");
 } else {

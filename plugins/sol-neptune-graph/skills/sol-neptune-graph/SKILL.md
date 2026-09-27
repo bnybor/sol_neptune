@@ -1,15 +1,27 @@
 ---
 name: sol-neptune-graph
-description: Query or explicitly update Sol's private Amazon Neptune graph through the OAuth-protected read_gremlin, write_gremlin, and delete_gremlin MCP tools. Use for bounded Gremlin reads, graph inspection, or user-requested mutations against Sol's Neptune graph. Never route these operations to Neon.
+description: Read or explicitly update Sol's private Amazon Neptune graph through guarded typed semantic operations and the OAuth-protected read_gremlin, write_gremlin, and delete_gremlin escape hatches. Use for graph-state reads, routine semantic persistence, deterministic operation recovery, bounded Gremlin inspection, or exceptional user-requested graph mutations. Never route these operations to Neon.
 ---
 
 # Sol Neptune Graph
 
-Use the `sol-neptune` MCP server's separately constrained Gremlin tools for work on Sol's private Amazon Neptune graph.
+Use the `sol-neptune` MCP server's typed semantic operations for routine persistence and its separately constrained Gremlin tools for exceptional work on Sol's private Amazon Neptune graph.
+
+## Preferred typed workflow
+
+1. Call `get_graph_state` and retain its exact `authority_epoch` and revision values.
+2. Resolve the semantic delta yourself. The server does not decide what a source, claim, concept, relationship, supersession, provenance, or decision state should mean.
+3. Choose a unique stable `operation_id` and call `commit_semantic_delta` with the observed authority/revision boundary, explicit origin, and bounded major-version-0 delta.
+4. Trust `complete` only because the server performed exact readback. If the result is `RECOVERY_NEEDED` or the acknowledgement was lost, call `reconcile_operation` with the same operation ID rather than constructing a replacement request.
+
+Temporary `$...` references let one request create related records without predicting allocator output. Reusing an operation ID with a different canonical payload is a permanent conflict. Reconciliation reuses the receipt's original allocation map and never selects replacement IDs.
 
 ## Operating rules
 
 - Treat Neptune as the only graph in scope for this plugin. Never send these queries or mutations to Neon.
+- Prefer `get_graph_state`, `commit_semantic_delta`, and `reconcile_operation` for routine foreground semantic persistence.
+- Keep semantic cognition at the caller: supply exact objects, properties, relationships, provenance, revision effects, and any explicit supersession. Do not ask the server to infer them.
+- Typed semantic commits are major-version-0-only and non-destructive. They cannot remove properties, edges, or vertices and cannot carry arbitrary Gremlin.
 - Use `read_gremlin` for reads. It is server-enforced read-only and rejects syntax or steps the classifier cannot verify.
 - Use `write_gremlin` only when the user explicitly requests additions or updates. It rejects pure reads and removals.
 - Use `delete_gremlin` only when the user explicitly requests removal of vertices, edges, or properties.
@@ -21,7 +33,9 @@ Use the `sol-neptune` MCP server's separately constrained Gremlin tools for work
 
 ## Unknown outcomes
 
-Every execution is non-retry-safe. If the server returns `UNKNOWN_MUTATION_OUTCOME`, do not repeat the mutation blindly. Use a bounded read keyed by a stable identifier to determine whether it completed, then decide whether any narrowly scoped cleanup or follow-up is necessary.
+Raw Gremlin execution is non-retry-safe. If a raw tool returns `UNKNOWN_MUTATION_OUTCOME`, do not repeat the mutation blindly. Use a bounded read keyed by a stable identifier to determine whether it completed, then decide whether any narrowly scoped cleanup or follow-up is necessary.
+
+Typed commits are idempotent by operation ID, but an ambiguous or partial typed outcome should still be handled through `reconcile_operation`. Do not generate a new operation ID for the same logical operation.
 
 ## Sensitive data
 

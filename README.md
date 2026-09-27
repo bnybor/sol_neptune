@@ -1,6 +1,6 @@
 # Sol Neptune Gremlin MCP
 
-This repository implements the `sol-neptune-gremlin` version `2.0.0` tool surface. It exposes separately constrained OAuth-protected `read_gremlin`, `write_gremlin`, and `delete_gremlin` graph actions. After server-side safety classification, the selected traversal is forwarded unchanged to the existing private Amazon Neptune executor. The authenticated, read-only `get_profile` identity utility remains unchanged and never calls Neptune.
+This repository implements the additive `sol-neptune-gremlin` version `2.1.0` tool surface. It preserves the separately constrained OAuth-protected `read_gremlin`, `write_gremlin`, and `delete_gremlin` graph actions plus the unchanged `get_profile` identity utility. It also exposes `get_graph_state`, `commit_semantic_delta`, and `reconcile_operation` for guarded typed semantic persistence through the same endpoint and authenticated connection.
 
 Neon is not read, written, migrated, synchronized, or reconfigured by this project. Neptune is not declared authoritative.
 
@@ -38,16 +38,30 @@ The classifier is deliberately deny-by-default. It tokenizes the full traversal,
 
 The private executor, OAuth scope and subject checks, request IDs, GraphSON handling, result limits, and no-retry behavior are shared by all three graph tools. In particular, an ambiguous invocation failure continues to return `UNKNOWN_MUTATION_OUTCOME` and the caller must not retry blindly.
 
+## Typed semantic operations
+
+`get_graph_state` returns the bounded canonical control-plane observation needed to prepare a write: Neptune authority and status, current semantic/graph/projection revisions, optional allocator cursors, and optional explicitly recorded v1 state. It validates that `sol:authority` names Neptune as the primary store and never infers v1 authority from the presence of v1 data.
+
+`commit_semantic_delta` accepts a caller-resolved major-version-0 delta. It does not infer claims, provenance, relationships, supersession, or decision state. The server canonicalizes the request, permanently binds the operation ID to its SHA-256 payload identity, resolves temporary object references through the established `S`, `K`, `T`, `N`, and `H` allocator cursors, and stores a durable `operation:<operation_id>` receipt. Creates, bounded property replacements, explicit relationships, and explicit supersession edges are the only supported mutations; arbitrary Gremlin and every deletion primitive are absent from the schema.
+
+The fresh-write phase is emitted as one multi-statement Gremlin request. Neptune executes those statements in one transaction. Guard statements first lock and validate the authority epoch, the requested revision boundary, current allocator cursors, target nonexistence, update preconditions, and relationship endpoints. The transaction then reserves the receipt and allocation map, applies the bounded mutation, and advances only the requested revision domains and affected allocator cursors. A response is not reported as complete until separate exact readback validates the receipt, target vertices, edge IDs and endpoints, critical properties, allocator advancement, and revision advancement.
+
+`reconcile_operation` reloads the canonical request and allocation decisions from an existing receipt. It can idempotently continue missing non-destructive work, but it will not choose new IDs, reinterpret an operation ID, overwrite conflicting targets, perform cleanup deletion, or invent a replacement semantic request. Conflicting or destructively repairable state returns a stable structured error such as `OPERATION_ID_PAYLOAD_CONFLICT`, `RELATIONSHIP_CONFLICT`, `RECOVERY_NEEDED`, or `MANUAL_REPAIR_REQUIRED`.
+
+The existing MCP URL, OAuth resource, connection identity, and four original tool schemas are unchanged. An existing connection only needs its tool manifest refreshed or rescanned to discover the three additions.
+
 ## Repository layout
 
 - `src/mcp/` — public MCP resource server, OAuth validation, and private Lambda invocation.
 - `src/mcp/gremlin-safety.ts` — conservative deny-by-default traversal classifier and tool-boundary enforcement.
+- `src/mcp/semantic-contracts.ts` — strict typed-operation input contracts and public tool schemas.
+- `src/mcp/semantic-operations.ts` — canonicalization, guarded state machine, Neptune transaction generation, exact verification, and deterministic reconciliation.
 - `src/executor/` — VPC executor and Neptune Data API client.
 - `src/shared/` — response contracts and safe structured logging.
 - `template.yaml` — dedicated SAM/CloudFormation stack.
 - `test/` — protocol, OAuth, executor, logging, and infrastructure tests.
 - `scripts/aws-preflight.sh` — read-only identity, Region, availability, resource, and cost check.
-- `scripts/smoke-test.mjs` — initialization, discovery, OAuth challenge, and optional authenticated profile plus bounded read.
+- `scripts/smoke-test.mjs` — initialization, seven-tool discovery, OAuth challenge, and optional authenticated graph state, profile, plus bounded read.
 - `scripts/integration-test.mjs` — uniquely identified create/read/delete/deletion-verification test for Neptune only.
 
 ## Local prerequisites and verification
@@ -341,6 +355,8 @@ The MCP contract, OAuth resource, executor code, and cluster writer endpoint do 
 - [AWS: Lambda Function URLs](https://docs.aws.amazon.com/lambda/latest/dg/urls-configuration.html)
 - [AWS: Securing Neptune with a VPC](https://docs.aws.amazon.com/neptune/latest/userguide/security-vpc.html)
 - [AWS: Running Gremlin through the AWS SDK](https://docs.aws.amazon.com/neptune/latest/userguide/access-graph-gremlin-sdk.html)
+- [AWS: Gremlin transactions in Neptune](https://docs.aws.amazon.com/neptune/latest/userguide/access-graph-gremlin-transactions.html)
+- [AWS: Gremlin standards compliance in Neptune](https://docs.aws.amazon.com/neptune/latest/userguide/access-graph-gremlin-differences.html)
 - [AWS: Native Gremlin step support](https://docs.aws.amazon.com/neptune/latest/userguide/gremlin-step-support.html)
 - [Apache TinkerPop: Gremlin language reference](https://tinkerpop.apache.org/docs/current/reference/)
 - [AWS: Converting a Neptune cluster to Serverless](https://docs.aws.amazon.com/neptune/latest/userguide/neptune-serverless-using.html)

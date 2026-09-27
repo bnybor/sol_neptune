@@ -2,8 +2,8 @@
 
 This is the installable ChatGPT/Codex plugin package for the OAuth-protected Sol
 Neptune MCP service. It is more than the remote MCP endpoint: it supplies the
-portable plugin identity, install-surface metadata, MCP connection, and bounded
-Gremlin operating instructions.
+portable plugin identity, install-surface metadata, MCP connection, guarded
+typed-semantic workflow, and bounded Gremlin operating instructions.
 
 ## Package contents
 
@@ -45,6 +45,12 @@ codex plugin add sol-neptune-graph@sol-neptune-local
 
 After installing or refreshing the plugin, start a new chat so its skill and
 MCP tools are loaded for that chat.
+
+The server endpoint and connection identity do not change when the typed tools
+are added. An already configured connection should discover
+`get_graph_state`, `commit_semantic_delta`, and `reconcile_operation` after a
+supported reconnect or tool-manifest rescan; recreating the plugin connection
+is not an implementation requirement.
 
 ## Validation
 

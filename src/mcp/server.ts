@@ -35,9 +35,24 @@ import {
   validateGremlinForTool,
   type GremlinToolMode,
 } from "./gremlin-safety.js";
+import {
+  commitSemanticDeltaInputJsonSchema,
+  commitSemanticDeltaInputSchema,
+  getGraphStateInputJsonSchema,
+  getGraphStateInputSchema,
+  reconcileOperationInputJsonSchema,
+  reconcileOperationInputSchema,
+  semanticOperationOutputJsonSchema,
+  type SemanticError,
+} from "./semantic-contracts.js";
+import {
+  createGremlinSemanticBackend,
+  createSemanticOperations,
+  type SemanticOperations,
+} from "./semantic-operations.js";
 
 export const SERVER_INSTRUCTIONS =
-  "This server exposes Sol's private structural graph through separate read, non-destructive write, and destructive-delete Gremlin tools. Use read_gremlin for bounded reads, write_gremlin only for explicitly requested additions or updates, and delete_gremlin only for explicitly requested removals. Never retry an unknown mutation outcome blindly.";
+  "This server exposes Sol's private structural graph through typed semantic operations and separate read, non-destructive write, and destructive-delete Gremlin tools. Prefer guarded typed operations for routine semantic persistence. Use read_gremlin for bounded reads, write_gremlin only for explicitly requested additions or updates, and delete_gremlin only for explicitly requested removals. Never retry an unknown mutation outcome blindly.";
 
 const queryInput = z
   .object({
@@ -172,12 +187,87 @@ export const getProfileTool = {
   },
 } as const;
 
+export const getGraphStateTool = {
+  name: "get_graph_state",
+  title: "Get graph state",
+  description:
+    "Read the coherent bounded authority, revision, allocator, and optional version-1 control state needed to prepare a guarded semantic operation. This tool never mutates the graph.",
+  inputSchema: getGraphStateInputJsonSchema,
+  outputSchema: {
+    type: "object",
+    additionalProperties: false,
+    required: [
+      "primary_store",
+      "authority_epoch",
+      "authority_status",
+      "semantic_revision",
+      "graph_revision",
+      "projection_revision",
+      "major_version",
+    ],
+    properties: {
+      primary_store: { type: "string", enum: ["neptune"] },
+      authority_epoch: { type: "string" },
+      authority_status: { type: "string" },
+      semantic_revision: { type: "integer" },
+      graph_revision: { type: "integer" },
+      projection_revision: { type: "integer" },
+      control_revision: { type: "integer" },
+      major_version: { type: "integer" },
+      allocators: { type: "object", additionalProperties: { type: "string" } },
+      v1: { type: "object", additionalProperties: true },
+    },
+  },
+  annotations: {
+    readOnlyHint: true,
+    destructiveHint: false,
+    openWorldHint: false,
+  },
+  securitySchemes,
+  _meta: { securitySchemes },
+} as const;
+
+export const commitSemanticDeltaTool = {
+  name: "commit_semantic_delta",
+  title: "Commit semantic delta",
+  description:
+    "Commit one caller-resolved major-version-0 semantic delta with authority and revision fencing, operation-id idempotency, durable ID allocation, exact readback, and no destructive removal.",
+  inputSchema: commitSemanticDeltaInputJsonSchema,
+  outputSchema: semanticOperationOutputJsonSchema,
+  annotations: {
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+  securitySchemes,
+  _meta: { securitySchemes },
+} as const;
+
+export const reconcileOperationTool = {
+  name: "reconcile_operation",
+  title: "Reconcile semantic operation",
+  description:
+    "Inspect and, when safe, continue the deterministic non-destructive work recorded by an existing typed semantic-operation receipt. This tool never invents a replacement semantic request.",
+  inputSchema: reconcileOperationInputJsonSchema,
+  outputSchema: semanticOperationOutputJsonSchema,
+  annotations: {
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+  securitySchemes,
+  _meta: { securitySchemes },
+} as const;
+
 type ServerDependencies = {
   authorization: string | undefined;
   config: McpConfig;
   invokeExecutor: ExecutorInvoker;
   logger?: SafeLogger;
   onAuthChallenge?: (challenge: string) => void;
+  semanticOperations?: SemanticOperations;
   tokenVerifier: TokenVerifier;
 };
 
@@ -230,6 +320,28 @@ function asToolResult(response: ExecutionResponse): CallToolResult {
   };
 }
 
+function semanticToolResult(
+  response: Record<string, unknown> | SemanticError,
+): CallToolResult {
+  const failed = response.ok === false;
+  return {
+    content: [{ type: "text", text: JSON.stringify(response) }],
+    structuredContent: response,
+    isError: failed,
+  };
+}
+
+function semanticValidationResult(message: string): CallToolResult {
+  return semanticToolResult({
+    ok: false,
+    error: {
+      code: "VALIDATION_ERROR",
+      message,
+      retry_safe: false,
+    },
+  });
+}
+
 function gremlinToolMode(name: string): GremlinToolMode | undefined {
   if (name === readGremlinTool.name) return "read";
   if (name === writeGremlinTool.name) return "write";
@@ -278,6 +390,9 @@ export function createMcpServer(dependencies: ServerDependencies): Server {
       writeGremlinTool,
       deleteGremlinTool,
       getProfileTool,
+      getGraphStateTool,
+      commitSemanticDeltaTool,
+      reconcileOperationTool,
     ],
   }));
 
@@ -286,7 +401,18 @@ export function createMcpServer(dependencies: ServerDependencies): Server {
     const mode = gremlinToolMode(request.params.name);
     const isGremlin = mode !== undefined;
     const isProfile = request.params.name === getProfileTool.name;
-    if (!isGremlin && !isProfile) {
+    const isGraphState = request.params.name === getGraphStateTool.name;
+    const isSemanticCommit =
+      request.params.name === commitSemanticDeltaTool.name;
+    const isReconciliation =
+      request.params.name === reconcileOperationTool.name;
+    if (
+      !isGremlin &&
+      !isProfile &&
+      !isGraphState &&
+      !isSemanticCommit &&
+      !isReconciliation
+    ) {
       return errorToolResult(
         failure(
           "QUERY_INVALID",
@@ -297,6 +423,7 @@ export function createMcpServer(dependencies: ServerDependencies): Server {
     }
 
     let query: string | undefined;
+    let semanticInput: unknown;
     if (isGremlin) {
       const input = queryInput.safeParse(request.params.arguments);
       if (
@@ -312,11 +439,45 @@ export function createMcpServer(dependencies: ServerDependencies): Server {
         );
       }
       query = input.data.query;
-    } else if (
-      !profileInput.safeParse(request.params.arguments ?? {}).success
-    ) {
+    } else if (isProfile) {
+      if (!profileInput.safeParse(request.params.arguments ?? {}).success) {
+        return errorToolResult(
+          failure("QUERY_INVALID", "The profile input is invalid.", requestId),
+        );
+      }
+    } else if (isGraphState) {
+      const parsed = getGraphStateInputSchema.safeParse(
+        request.params.arguments ?? {},
+      );
+      if (!parsed.success) {
+        return semanticValidationResult("The graph-state input is invalid.");
+      }
+      semanticInput = parsed.data;
+    } else if (isSemanticCommit) {
+      const parsed = commitSemanticDeltaInputSchema.safeParse(
+        request.params.arguments,
+      );
+      if (!parsed.success) {
+        return semanticValidationResult("The semantic delta input is invalid.");
+      }
+      semanticInput = parsed.data;
+    } else if (isReconciliation) {
+      const parsed = reconcileOperationInputSchema.safeParse(
+        request.params.arguments,
+      );
+      if (!parsed.success) {
+        return semanticValidationResult(
+          "The operation-reconciliation input is invalid.",
+        );
+      }
+      semanticInput = parsed.data;
+    } else {
       return errorToolResult(
-        failure("QUERY_INVALID", "The profile input is invalid.", requestId),
+        failure(
+          "QUERY_INVALID",
+          "The requested tool input is invalid.",
+          requestId,
+        ),
       );
     }
 
@@ -360,6 +521,34 @@ export function createMcpServer(dependencies: ServerDependencies): Server {
 
     if (isProfile) {
       return profileResult(subject);
+    }
+
+    const semanticOperations =
+      dependencies.semanticOperations ??
+      createSemanticOperations(
+        createGremlinSemanticBackend(dependencies.invokeExecutor),
+        { logger },
+      );
+    if (isGraphState) {
+      const response = await semanticOperations.getGraphState(
+        semanticInput as z.infer<typeof getGraphStateInputSchema>,
+        requestId,
+      );
+      return semanticToolResult(response);
+    }
+    if (isSemanticCommit) {
+      const response = await semanticOperations.commitSemanticDelta(
+        semanticInput as z.infer<typeof commitSemanticDeltaInputSchema>,
+        requestId,
+      );
+      return semanticToolResult(response);
+    }
+    if (isReconciliation) {
+      const response = await semanticOperations.reconcileOperation(
+        semanticInput as z.infer<typeof reconcileOperationInputSchema>,
+        requestId,
+      );
+      return semanticToolResult(response);
     }
 
     if (query === undefined || mode === undefined) {

@@ -7,6 +7,13 @@ export type SafeLogFields = {
   elapsed_ms?: number;
   result_bytes?: number;
   sanitized_error_class?: string;
+  operation_id?: string;
+  tool_name?: string;
+  authority_epoch?: string;
+  canonical_payload_hash?: string;
+  allocated_ids?: string;
+  expected_revision?: number;
+  observed_revision?: number;
 };
 
 export type SafeLogger = {

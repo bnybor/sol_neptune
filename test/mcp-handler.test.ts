@@ -48,7 +48,7 @@ describe("MCP Lambda handler", () => {
     expect(result.instructions).toContain("unknown mutation outcome");
   });
 
-  it("lists separately constrained graph tools plus the profile tool", async () => {
+  it("preserves the four existing tools and adds typed semantic operations", async () => {
     const handler = createHandler({ config });
     const response = await handler(
       functionUrlEvent("/mcp", { body: jsonRpcRequest("tools/list", {}) }),
@@ -57,11 +57,18 @@ describe("MCP Lambda handler", () => {
     const result = resultOf(parseResponseBody(response.body));
     const tools = result.tools as Record<string, unknown>[];
 
-    expect(tools).toHaveLength(4);
+    expect(tools).toHaveLength(7);
     const readTool = tools.find((tool) => tool.name === "read_gremlin");
     const writeTool = tools.find((tool) => tool.name === "write_gremlin");
     const deleteTool = tools.find((tool) => tool.name === "delete_gremlin");
     const profileTool = tools.find((tool) => tool.name === "get_profile");
+    const stateTool = tools.find((tool) => tool.name === "get_graph_state");
+    const commitTool = tools.find(
+      (tool) => tool.name === "commit_semantic_delta",
+    );
+    const reconcileTool = tools.find(
+      (tool) => tool.name === "reconcile_operation",
+    );
     expect(readTool?.description).toContain("cannot mutate the graph");
     expect(writeTool?.description).toContain("rejects removals");
     expect(deleteTool?.description).toContain(
@@ -122,6 +129,91 @@ describe("MCP Lambda handler", () => {
       securitySchemes: [{ type: "oauth2", scopes: ["graph:execute"] }],
       _meta: { "openai/profile": true },
     });
+    expect(stateTool).toMatchObject({
+      name: "get_graph_state",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          include_allocators: { type: "boolean", default: true },
+          include_v1_state: { type: "boolean", default: false },
+        },
+      },
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        openWorldHint: false,
+      },
+      securitySchemes: [{ type: "oauth2", scopes: ["graph:execute"] }],
+    });
+    expect(commitTool).toMatchObject({
+      name: "commit_semantic_delta",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["operation_id", "authority_epoch", "expected", "origin"],
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    });
+    expect(reconcileTool).toMatchObject({
+      name: "reconcile_operation",
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    });
+  });
+
+  it("routes typed semantic tools through the authenticated semantic service", async () => {
+    const invokeExecutor = vi.fn();
+    const semanticOperations = {
+      getGraphState: vi.fn().mockResolvedValue({
+        primary_store: "neptune",
+        authority_epoch: "epoch-1",
+        authority_status: "active",
+        semantic_revision: 10,
+        graph_revision: 10,
+        projection_revision: 10,
+        major_version: 0,
+      }),
+      commitSemanticDelta: vi.fn(),
+      reconcileOperation: vi.fn(),
+    };
+    const handler = createHandler({
+      config,
+      invokeExecutor,
+      semanticOperations,
+      tokenVerifier: vi.fn().mockResolvedValue({ sub: config.allowedSubject }),
+    });
+    const response = await handler(
+      functionUrlEvent("/mcp", {
+        authorization: "Bearer valid-token",
+        body: jsonRpcRequest("tools/call", {
+          name: "get_graph_state",
+          arguments: { include_allocators: false },
+        }),
+      }),
+      context,
+    );
+    const result = resultOf(parseResponseBody(response.body));
+
+    expect(result.isError).toBe(false);
+    expect(result.structuredContent).toMatchObject({
+      primary_store: "neptune",
+      semantic_revision: 10,
+    });
+    expect(semanticOperations.getGraphState).toHaveBeenCalledWith(
+      { include_allocators: false, include_v1_state: false },
+      expect.any(String),
+    );
+    expect(invokeExecutor).not.toHaveBeenCalled();
   });
 
   it("returns a stable opaque profile without invoking Neptune", async () => {

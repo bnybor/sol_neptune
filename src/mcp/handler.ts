@@ -19,10 +19,12 @@ import {
   type ExecutorInvoker,
 } from "./executor-invoker.js";
 import { createMcpServer } from "./server.js";
+import type { SemanticOperations } from "./semantic-operations.js";
 
 type HandlerDependencies = {
   config?: McpConfig;
   invokeExecutor?: ExecutorInvoker;
+  semanticOperations?: SemanticOperations;
   tokenVerifier?: TokenVerifier;
 };
 
@@ -155,6 +157,9 @@ export function createHandler(
         authorization: event.headers.authorization,
         config,
         invokeExecutor,
+        ...(dependencies.semanticOperations === undefined
+          ? {}
+          : { semanticOperations: dependencies.semanticOperations }),
         tokenVerifier,
         onAuthChallenge(value) {
           challenge = value;
