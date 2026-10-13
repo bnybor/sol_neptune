@@ -1,16 +1,22 @@
 import { z } from "zod";
 
-const identifier = z
+export const IDENTIFIER_PATTERN = "^[A-Za-z0-9][A-Za-z0-9._:/-]*$";
+export const TEMPORARY_REFERENCE_PATTERN = "^\\$[A-Za-z0-9_.:-]+$";
+
+export const identifierSchema = z
   .string()
   .min(1)
   .max(256)
-  .regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]*$/u);
-const temporaryReference = z
+  .regex(new RegExp(IDENTIFIER_PATTERN, "u"));
+export const temporaryReferenceSchema = z
   .string()
   .min(2)
   .max(65)
-  .regex(/^\$[A-Za-z][A-Za-z0-9_-]*$/u);
-const identifierOrReference = z.union([identifier, temporaryReference]);
+  .regex(new RegExp(TEMPORARY_REFERENCE_PATTERN, "u"));
+export const identifierOrReferenceSchema = z.union([
+  identifierSchema,
+  temporaryReferenceSchema,
+]);
 const propertyKey = z
   .string()
   .min(1)
@@ -35,8 +41,8 @@ const propertyRecordSchema = z.record(propertyKey, semanticPropertyValueSchema);
 
 const semanticCreateSchema = z
   .object({
-    id: identifier.optional(),
-    ref: temporaryReference.optional(),
+    id: identifierSchema.optional(),
+    ref: temporaryReferenceSchema.optional(),
     graph_label: z.string().min(1).max(512).optional(),
     object_type: z.string().min(1).max(128),
     label: z.string().min(1).max(512).optional(),
@@ -44,8 +50,12 @@ const semanticCreateSchema = z
     decision_state: z.string().max(128).optional(),
     epistemic_class: z.string().max(128).optional(),
     sensitivity: z.string().max(128).optional(),
-    source_refs: z.array(identifierOrReference).max(100).optional(),
-    about_ref: identifierOrReference.optional(),
+    source_refs: z
+      .array(identifierOrReferenceSchema)
+      .min(1)
+      .max(100)
+      .optional(),
+    about_ref: identifierOrReferenceSchema.optional(),
     properties: propertyRecordSchema.optional(),
   })
   .strict()
@@ -56,11 +66,65 @@ const semanticCreateSchema = z
         message: "Exactly one of id or ref is required.",
       });
     }
+    const propertySourceRefs = value.properties?.source_refs;
+    if (propertySourceRefs !== undefined) {
+      if (
+        !Array.isArray(propertySourceRefs) ||
+        propertySourceRefs.length === 0 ||
+        !propertySourceRefs.every(
+          (candidate) =>
+            typeof candidate === "string" &&
+            identifierOrReferenceSchema.safeParse(candidate).success,
+        )
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["properties", "source_refs"],
+          message:
+            "properties.source_refs must be a non-empty list of semantic ids or temporary references.",
+        });
+      } else if (
+        value.source_refs !== undefined &&
+        [...propertySourceRefs].sort().join("\u0000") !==
+          [...value.source_refs].sort().join("\u0000")
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["properties", "source_refs"],
+          message:
+            "source_refs conflicts with properties.source_refs; supply one equivalent value.",
+        });
+      }
+    }
+    const propertyAboutRef = value.properties?.about_ref;
+    if (propertyAboutRef !== undefined) {
+      if (
+        typeof propertyAboutRef !== "string" ||
+        !identifierOrReferenceSchema.safeParse(propertyAboutRef).success
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["properties", "about_ref"],
+          message:
+            "properties.about_ref must be one semantic id or temporary reference.",
+        });
+      } else if (
+        value.about_ref !== undefined &&
+        propertyAboutRef !== value.about_ref
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["properties", "about_ref"],
+          message:
+            "about_ref conflicts with properties.about_ref; supply one equivalent value.",
+        });
+      }
+    }
   });
 
 const propertyUpdateSchema = z
   .object({
-    id: identifier,
+    id: identifierSchema,
     set: propertyRecordSchema.refine(
       (value) => Object.keys(value).length > 0,
       "At least one property must be set.",
@@ -71,11 +135,11 @@ const propertyUpdateSchema = z
 
 const relationshipCreateSchema = z
   .object({
-    id: identifier.optional(),
-    ref: temporaryReference.optional(),
-    out: identifierOrReference,
+    id: identifierSchema.optional(),
+    ref: temporaryReferenceSchema.optional(),
+    out: identifierOrReferenceSchema,
     label: z.string().min(1).max(256),
-    in: identifierOrReference,
+    in: identifierOrReferenceSchema,
     properties: propertyRecordSchema.optional(),
   })
   .strict()
@@ -90,8 +154,8 @@ const relationshipCreateSchema = z
 
 const supersessionSchema = z
   .object({
-    newer: identifierOrReference,
-    older: identifierOrReference,
+    newer: identifierOrReferenceSchema,
+    older: identifierOrReferenceSchema,
   })
   .strict();
 
@@ -105,7 +169,7 @@ export type GetGraphStateInput = z.infer<typeof getGraphStateInputSchema>;
 
 export const commitSemanticDeltaInputSchema = z
   .object({
-    operation_id: identifier.max(128),
+    operation_id: identifierSchema.max(128),
     authority_epoch: z.string().min(1).max(256),
     expected: z
       .object({
@@ -162,7 +226,7 @@ export type CommitSemanticDeltaInput = z.infer<
 
 export const reconcileOperationInputSchema = z
   .object({
-    operation_id: identifier.max(128),
+    operation_id: identifierSchema.max(128),
     authority_epoch: z.string().min(1).max(256).optional(),
     allow_continue: z.boolean().default(true),
   })
@@ -197,6 +261,9 @@ export const semanticErrorCodes = [
   "REVISION_CONFLICT",
   "OPERATION_ID_PAYLOAD_CONFLICT",
   "ID_ALLOCATION_CONFLICT",
+  "REFERENCE_NOT_FOUND",
+  "REFERENCE_TYPE_MISMATCH",
+  "TEMP_REF_UNRESOLVED",
   "TARGET_ALREADY_EXISTS_CONFLICT",
   "RELATIONSHIP_CONFLICT",
   "WRITER_SCOPE_DENIED",
@@ -270,12 +337,30 @@ const propertiesJsonSchema = {
   additionalProperties: propertyValueJsonSchema,
 } as const;
 
+const identifierJsonSchema = {
+  type: "string",
+  minLength: 1,
+  maxLength: 256,
+  pattern: IDENTIFIER_PATTERN,
+} as const;
+
+const temporaryReferenceJsonSchema = {
+  type: "string",
+  minLength: 2,
+  maxLength: 65,
+  pattern: TEMPORARY_REFERENCE_PATTERN,
+} as const;
+
+const identifierOrReferenceJsonSchema = {
+  anyOf: [identifierJsonSchema, temporaryReferenceJsonSchema],
+} as const;
+
 export const commitSemanticDeltaInputJsonSchema = {
   type: "object",
   additionalProperties: false,
   required: ["operation_id", "authority_epoch", "expected", "origin"],
   properties: {
-    operation_id: { type: "string", minLength: 1, maxLength: 128 },
+    operation_id: { ...identifierJsonSchema, maxLength: 128 },
     authority_epoch: { type: "string", minLength: 1, maxLength: 256 },
     expected: {
       type: "object",
@@ -306,8 +391,8 @@ export const commitSemanticDeltaInputJsonSchema = {
         additionalProperties: false,
         required: ["object_type"],
         properties: {
-          id: { type: "string" },
-          ref: { type: "string", pattern: "^\\$" },
+          id: identifierJsonSchema,
+          ref: temporaryReferenceJsonSchema,
           graph_label: { type: "string", minLength: 1, maxLength: 512 },
           object_type: { type: "string", minLength: 1, maxLength: 128 },
           label: { type: "string", minLength: 1, maxLength: 512 },
@@ -317,10 +402,11 @@ export const commitSemanticDeltaInputJsonSchema = {
           sensitivity: { type: "string", maxLength: 128 },
           source_refs: {
             type: "array",
+            minItems: 1,
             maxItems: 100,
-            items: { type: "string" },
+            items: identifierOrReferenceJsonSchema,
           },
-          about_ref: { type: "string" },
+          about_ref: identifierOrReferenceJsonSchema,
           properties: propertiesJsonSchema,
         },
       },
@@ -333,7 +419,7 @@ export const commitSemanticDeltaInputJsonSchema = {
         additionalProperties: false,
         required: ["id", "set"],
         properties: {
-          id: { type: "string" },
+          id: identifierJsonSchema,
           set: propertiesJsonSchema,
           expected: propertiesJsonSchema,
         },
@@ -347,11 +433,11 @@ export const commitSemanticDeltaInputJsonSchema = {
         additionalProperties: false,
         required: ["out", "label", "in"],
         properties: {
-          id: { type: "string" },
-          ref: { type: "string", pattern: "^\\$" },
-          out: { type: "string" },
+          id: identifierJsonSchema,
+          ref: temporaryReferenceJsonSchema,
+          out: identifierOrReferenceJsonSchema,
           label: { type: "string", minLength: 1, maxLength: 256 },
-          in: { type: "string" },
+          in: identifierOrReferenceJsonSchema,
           properties: propertiesJsonSchema,
         },
       },
@@ -363,7 +449,10 @@ export const commitSemanticDeltaInputJsonSchema = {
         type: "object",
         additionalProperties: false,
         required: ["newer", "older"],
-        properties: { newer: { type: "string" }, older: { type: "string" } },
+        properties: {
+          newer: identifierOrReferenceJsonSchema,
+          older: identifierOrReferenceJsonSchema,
+        },
       },
     },
     revision_effect: {
@@ -383,7 +472,7 @@ export const reconcileOperationInputJsonSchema = {
   additionalProperties: false,
   required: ["operation_id"],
   properties: {
-    operation_id: { type: "string", minLength: 1, maxLength: 128 },
+    operation_id: { ...identifierJsonSchema, maxLength: 128 },
     authority_epoch: { type: "string", minLength: 1, maxLength: 256 },
     allow_continue: { type: "boolean", default: true },
   },

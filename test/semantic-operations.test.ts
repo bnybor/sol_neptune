@@ -1,5 +1,8 @@
 import {
+  commitSemanticDeltaInputJsonSchema,
   commitSemanticDeltaInputSchema,
+  TEMPORARY_REFERENCE_PATTERN,
+  temporaryReferenceSchema,
   type CommitSemanticDeltaInput,
   type GraphState,
   type SemanticPropertyValue,
@@ -7,6 +10,7 @@ import {
 import {
   createGremlinSemanticBackend,
   createSemanticOperations,
+  parseCommitSemanticDeltaInput,
   type SemanticOperationBackend,
   type SemanticOperationPlan,
 } from "../src/mcp/semantic-operations.js";
@@ -61,6 +65,8 @@ class FakeSemanticBackend implements SemanticOperationBackend {
     | "revision_race"
     | "authority_race"
     | "wrong_edge"
+    | "wrong_vertex_label"
+    | "missing_semantic_label"
     | "completion_lost_ack" = "normal";
 
   public readGraphState(input: {
@@ -117,7 +123,7 @@ class FakeSemanticBackend implements SemanticOperationBackend {
     this.receipts.set(plan.operationId, { plan, status: "writing" });
     this.vertices.set(plan.receiptId, {
       id: plan.receiptId,
-      label: "GraphOperation",
+      __graph_label: "GraphOperation",
       canonical_payload_hash: [plan.canonicalPayloadHash],
       status: ["writing"],
     });
@@ -126,7 +132,7 @@ class FakeSemanticBackend implements SemanticOperationBackend {
   private storeVertex(vertex: SemanticOperationPlan["creates"][number]): void {
     this.vertices.set(vertex.id, {
       id: vertex.id,
-      label: vertex.graphLabel,
+      __graph_label: vertex.graphLabel,
       ...asStoredProperties(vertex.properties),
     });
   }
@@ -198,6 +204,14 @@ class FakeSemanticBackend implements SemanticOperationBackend {
       return Promise.resolve();
     }
     this.applyAll(plan);
+    if (this.mode === "wrong_vertex_label" && plan.creates[0]) {
+      const vertex = this.vertices.get(plan.creates[0].id);
+      if (vertex) vertex.__graph_label = "WrongLabel";
+    }
+    if (this.mode === "missing_semantic_label" && plan.creates[0]) {
+      const vertex = this.vertices.get(plan.creates[0].id);
+      if (vertex) delete vertex.label;
+    }
     if (this.mode === "wrong_edge" && plan.relationships[0]) {
       const edge = this.edges.get(plan.relationships[0].id);
       if (edge) edge.in = "N-conflict";
@@ -278,6 +292,71 @@ function semanticInput(
   });
 }
 
+describe("typed semantic input contract", () => {
+  it("uses one complete temporary-reference grammar at runtime and in the public schema", () => {
+    for (const value of [
+      "$source",
+      "$claim1",
+      "$concept",
+      "$edge-1",
+      "$tmp.foo",
+    ]) {
+      expect(temporaryReferenceSchema.safeParse(value).success).toBe(true);
+    }
+    for (const value of ["$", "source", "$ source", "$foo/bar"]) {
+      expect(temporaryReferenceSchema.safeParse(value).success).toBe(false);
+    }
+
+    const create =
+      commitSemanticDeltaInputJsonSchema.properties.creates.items.properties;
+    const relationship =
+      commitSemanticDeltaInputJsonSchema.properties.relationships.items
+        .properties;
+    const supersession =
+      commitSemanticDeltaInputJsonSchema.properties.supersessions.items
+        .properties;
+    expect(create.ref.pattern).toBe(TEMPORARY_REFERENCE_PATTERN);
+    expect(create.source_refs.items.anyOf[1].pattern).toBe(
+      TEMPORARY_REFERENCE_PATTERN,
+    );
+    expect(create.about_ref.anyOf[1].pattern).toBe(TEMPORARY_REFERENCE_PATTERN);
+    expect(relationship.ref.pattern).toBe(TEMPORARY_REFERENCE_PATTERN);
+    expect(relationship.out.anyOf[1].pattern).toBe(TEMPORARY_REFERENCE_PATTERN);
+    expect(relationship.in.anyOf[1].pattern).toBe(TEMPORARY_REFERENCE_PATTERN);
+    expect(supersession.newer.anyOf[1].pattern).toBe(
+      TEMPORARY_REFERENCE_PATTERN,
+    );
+    expect(supersession.older.anyOf[1].pattern).toBe(
+      TEMPORARY_REFERENCE_PATTERN,
+    );
+  });
+
+  it("rejects conflicting dedicated and generic aliases as VALIDATION_ERROR", () => {
+    const input = {
+      ...semanticInput(),
+      creates: [
+        {
+          id: "K1000999",
+          object_type: "CLAIM",
+          source_refs: ["S1000001"],
+          about_ref: "T1000001",
+          properties: {
+            source_refs: ["S1000002"],
+            about_ref: "T1000002",
+          },
+        },
+      ],
+    };
+    expect(commitSemanticDeltaInputSchema.safeParse(input).success).toBe(false);
+    try {
+      parseCommitSemanticDeltaInput(input);
+      throw new Error("expected validation failure");
+    } catch (error) {
+      expect(error).toMatchObject({ code: "VALIDATION_ERROR" });
+    }
+  });
+});
+
 describe("typed semantic operation state machine", () => {
   it("commits a source and claim with durable allocation and exact verification", async () => {
     const backend = new FakeSemanticBackend();
@@ -305,6 +384,15 @@ describe("typed semantic operation state machine", () => {
     });
     expect(backend.vertices.has("S1000097")).toBe(true);
     expect(backend.vertices.has("K1000242")).toBe(true);
+    expect(backend.vertices.get("S1000097")).toMatchObject({
+      __graph_label: "Object",
+      label: ["Typed semantic test source"],
+    });
+    expect(backend.vertices.get("K1000242")).toMatchObject({
+      __graph_label: "Object",
+      label: ["typed_semantic_test_claim"],
+      source_refs: ["S1000097"],
+    });
     expect(backend.edges.has("port:K1000242:source:S1000097")).toBe(true);
     expect(backend.allocators.next_primary_source_id).toBe("S1000098");
     expect(backend.allocators.next_primary_claim_id).toBe("K1000243");
@@ -312,6 +400,214 @@ describe("typed semantic operation state machine", () => {
       "complete",
     );
   });
+
+  it("serializes every allocated semantic kind with canonical Object and a semantic label property", async () => {
+    const backend = new FakeSemanticBackend();
+    const operations = createSemanticOperations(backend);
+    const creates = [
+      {
+        ref: "$source",
+        object_type: "SOURCE_EVIDENCE",
+        label: "source_label",
+      },
+      { ref: "$claim", object_type: "CLAIM", label: "claim_label" },
+      { ref: "$concept", object_type: "CONCEPT", label: "concept_label" },
+      { ref: "$entity", object_type: "ENTITY", label: "entity_label" },
+      { ref: "$hole", object_type: "HOLE", label: "hole_label" },
+    ] satisfies CommitSemanticDeltaInput["creates"];
+
+    const result = await operations.commitSemanticDelta(
+      semanticInput({
+        operation_id: "typed-all-object-kinds",
+        creates,
+      }),
+      "request-all-kinds",
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("expected successful semantic operation");
+    for (const create of creates) {
+      const id = result.allocated_ids[create.ref];
+      expect(backend.vertices.get(id ?? "")).toMatchObject({
+        __graph_label: "Object",
+        object_type: [create.object_type],
+        label: [create.label],
+        major_version: [0],
+      });
+    }
+  });
+
+  it("keeps explicit graph_label independent from semantic label", async () => {
+    const backend = new FakeSemanticBackend();
+    const operations = createSemanticOperations(backend);
+    const result = await operations.commitSemanticDelta(
+      semanticInput({
+        operation_id: "typed-explicit-graph-label",
+        creates: [
+          {
+            id: "K0001",
+            graph_label: "SpecialObject",
+            object_type: "CLAIM",
+            label: "semantic_label",
+          },
+        ],
+      }),
+      "request-explicit-graph-label",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(backend.vertices.get("K0001")).toMatchObject({
+      __graph_label: "SpecialObject",
+      label: ["semantic_label"],
+    });
+  });
+
+  it("normalizes dedicated and generic source_refs/about_ref aliases to identical properties and edges", async () => {
+    const run = async (dedicated: boolean) => {
+      const backend = new FakeSemanticBackend();
+      backend.vertices.set("S0001", {
+        id: "S0001",
+        __graph_label: "Object",
+        object_type: ["SOURCE_EVIDENCE"],
+        major_version: [0],
+      });
+      backend.vertices.set("T0001", {
+        id: "T0001",
+        __graph_label: "Object",
+        object_type: ["CONCEPT"],
+        major_version: [0],
+      });
+      const operations = createSemanticOperations(backend);
+      const aliases = dedicated
+        ? { source_refs: ["S0001"], about_ref: "T0001" }
+        : { properties: { source_refs: ["S0001"], about_ref: "T0001" } };
+      const result = await operations.commitSemanticDelta(
+        semanticInput({
+          operation_id: dedicated
+            ? "typed-dedicated-alias"
+            : "typed-generic-alias",
+          creates: [
+            {
+              id: "K0001",
+              object_type: "CLAIM",
+              label: "alias_claim",
+              ...aliases,
+            },
+          ],
+        }),
+        dedicated ? "request-dedicated" : "request-generic",
+      );
+      expect(result.ok).toBe(true);
+      return backend;
+    };
+
+    const dedicated = await run(true);
+    const generic = await run(false);
+    for (const backend of [dedicated, generic]) {
+      expect(backend.vertices.get("K0001")).toMatchObject({
+        source_refs: ["S0001"],
+        about_ref: ["T0001"],
+      });
+      expect(backend.edges.has("port:K0001:source:S0001")).toBe(true);
+      expect(backend.edges.has("port:K0001:about:T0001")).toBe(true);
+    }
+  });
+
+  it("resolves temporary source_refs and about_ref into properties and deterministic endpoints", async () => {
+    const backend = new FakeSemanticBackend();
+    const operations = createSemanticOperations(backend);
+    const result = await operations.commitSemanticDelta(
+      semanticInput({
+        operation_id: "typed-temporary-aliases",
+        creates: [
+          { ref: "$source", object_type: "SOURCE_EVIDENCE" },
+          { ref: "$concept", object_type: "CONCEPT" },
+          {
+            ref: "$claim",
+            object_type: "CLAIM",
+            source_refs: ["$source"],
+            about_ref: "$concept",
+          },
+        ],
+      }),
+      "request-temporary-aliases",
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("expected successful semantic operation");
+    const claimId = result.allocated_ids.$claim ?? "";
+    const sourceId = result.allocated_ids.$source ?? "";
+    const conceptId = result.allocated_ids.$concept ?? "";
+    expect(backend.vertices.get(claimId)).toMatchObject({
+      source_refs: [sourceId],
+      about_ref: [conceptId],
+    });
+    expect(backend.edges.has(`port:${claimId}:source:${sourceId}`)).toBe(true);
+    expect(backend.edges.has(`port:${claimId}:about:${conceptId}`)).toBe(true);
+  });
+
+  it("returns structured reference errors for missing and unresolved caller references", async () => {
+    const missingBackend = new FakeSemanticBackend();
+    const missing = await createSemanticOperations(
+      missingBackend,
+    ).commitSemanticDelta(
+      semanticInput({
+        operation_id: "typed-missing-reference",
+        creates: [
+          {
+            id: "K0001",
+            object_type: "CLAIM",
+            source_refs: ["S404"],
+          },
+        ],
+      }),
+      "request-missing-reference",
+    );
+    expect(missing).toMatchObject({
+      ok: false,
+      error: { code: "REFERENCE_NOT_FOUND" },
+    });
+
+    const unresolvedBackend = new FakeSemanticBackend();
+    const unresolved = await createSemanticOperations(
+      unresolvedBackend,
+    ).commitSemanticDelta(
+      semanticInput({
+        operation_id: "typed-unresolved-reference",
+        creates: [
+          {
+            id: "K0001",
+            object_type: "CLAIM",
+            about_ref: "$missing",
+          },
+        ],
+      }),
+      "request-unresolved-reference",
+    );
+    expect(unresolved).toMatchObject({
+      ok: false,
+      error: { code: "TEMP_REF_UNRESOLVED" },
+    });
+  });
+
+  it.each(["wrong_vertex_label", "missing_semantic_label"] as const)(
+    "fails canonical verification for %s",
+    async (mode) => {
+      const backend = new FakeSemanticBackend();
+      backend.mode = mode;
+      const result = await createSemanticOperations(
+        backend,
+      ).commitSemanticDelta(semanticInput(), `request-${mode}`);
+
+      expect(result).toMatchObject({
+        ok: false,
+        error: { code: "RECOVERY_NEEDED" },
+      });
+      expect(backend.receipts.get("typed-test-operation")?.status).toBe(
+        "recovery_needed",
+      );
+    },
+  );
 
   it("returns already_complete without creating anything on an identical retry", async () => {
     const backend = new FakeSemanticBackend();
@@ -690,9 +986,26 @@ describe("Gremlin semantic-operation backend", () => {
       creates: [
         {
           id: "S1000097",
-          graphLabel: "Typed source",
+          graphLabel: "Object",
           properties: {
             object_type: "SOURCE_EVIDENCE",
+            label: "Typed source",
+            major_version: 0,
+            origin_identity: "sol",
+            origin_actor: "N1002",
+            origin_context: "test",
+            authoritative_operation_id: "op-1",
+            authoritative_revision: 11,
+            authority_epoch: "epoch-1",
+          },
+        },
+        {
+          id: "K1000242",
+          graphLabel: "Object",
+          properties: {
+            object_type: "CLAIM",
+            label: "Typed claim",
+            source_refs: ["S1000097"],
             major_version: 0,
             origin_identity: "sol",
             origin_actor: "N1002",
@@ -704,7 +1017,25 @@ describe("Gremlin semantic-operation backend", () => {
         },
       ],
       updates: [],
-      relationships: [],
+      relationships: [
+        {
+          id: "port:K1000242:source:S1000097",
+          out: "K1000242",
+          label: "source",
+          in: "S1000097",
+          properties: {
+            slot: "source",
+            epistemic_class: "port",
+            major_version: 0,
+            origin_identity: "sol",
+            origin_actor: "N1002",
+            origin_context: "test",
+            authoritative_operation_id: "op-1",
+            authoritative_revision: 11,
+            authority_epoch: "epoch-1",
+          },
+        },
+      ],
     };
 
     await backend.applyNewOperation(plan, "request-write");
@@ -715,8 +1046,47 @@ describe("Gremlin semantic-operation backend", () => {
     expect(query).toContain("has('last_semantic_revision',10)");
     expect(query).toContain("next_primary_source_id");
     expect(query).toContain("canonical_payload_hash");
-    expect(query).toContain('g.addV("Typed source")');
+    expect(query).toContain('g.addV("Object")');
+    expect(query).toContain('.property(single,"label","Typed source")');
+    expect(query).not.toContain('g.addV("Typed source")');
+    expect(query).not.toContain(
+      'g.V("S1000097").fold().coalesce(unfold(),fail',
+    );
+    expect(query).not.toContain(
+      'g.V("K1000242").fold().coalesce(unfold(),fail',
+    );
     expect(query).toContain(";g.V('sol:sync_state')");
     expect(query).not.toContain(".drop(");
+  });
+
+  it("reads Neptune graph labels separately from semantic label properties", async () => {
+    const invokeExecutor: ExecutorInvoker = vi.fn().mockResolvedValue(
+      executionSuccess([
+        {
+          id: "K0001",
+          graph_label: "Object",
+          properties: {
+            label: ["semantic_label"],
+            object_type: ["CLAIM"],
+            major_version: [0],
+          },
+        },
+      ]),
+    );
+    const backend = createGremlinSemanticBackend(invokeExecutor);
+
+    const vertices = await backend.readVertices(["K0001"], "request-read");
+
+    expect(vertices.get("K0001")).toEqual({
+      id: "K0001",
+      __graph_label: "Object",
+      label: ["semantic_label"],
+      object_type: ["CLAIM"],
+      major_version: [0],
+    });
+    expect(invokeExecutor).toHaveBeenCalledWith(
+      expect.stringContaining("project('id','graph_label','properties')"),
+      "request-read",
+    );
   });
 });

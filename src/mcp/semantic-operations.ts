@@ -23,6 +23,7 @@ import { MAX_QUERY_BYTES } from "../shared/contracts.js";
 
 type UnknownRecord = Record<string, unknown>;
 type PropertyMap = Record<string, SemanticPropertyValue>;
+type SemanticCreateInput = CommitSemanticDeltaInput["creates"][number];
 type ExpectedProperty =
   { present: false } | { present: true; value: SemanticPropertyValue };
 
@@ -167,6 +168,9 @@ const OBJECT_ALLOCATORS: Record<
   NODE: { field: "next_primary_node_id", prefix: "N" },
   HOLE: { field: "next_primary_hole_id", prefix: "H" },
 };
+
+const DEFAULT_SEMANTIC_GRAPH_LABEL = "Object";
+const INTERNAL_GRAPH_LABEL_KEY = "__graph_label";
 
 const RESERVED_PROPERTIES = new Set([
   "id",
@@ -316,12 +320,39 @@ function resolveReference(
   const resolved = allocatedIds[value];
   if (!resolved) {
     throw new SemanticFailure(
-      "VALIDATION_ERROR",
+      "TEMP_REF_UNRESOLVED",
       `Temporary reference ${value} is not defined by this operation.`,
       false,
     );
   }
   return resolved;
+}
+
+function normalizedCreateReferences(create: SemanticCreateInput): {
+  sourceRefs: string[];
+  aboutRef?: string;
+} {
+  const genericSourceRefs = create.properties?.source_refs;
+  const genericAboutRef = create.properties?.about_ref;
+  const sourceRefs =
+    create.source_refs ??
+    (Array.isArray(genericSourceRefs)
+      ? (genericSourceRefs as string[])
+      : undefined);
+  const aboutRef =
+    create.about_ref ??
+    (typeof genericAboutRef === "string" ? genericAboutRef : undefined);
+  return {
+    sourceRefs: sourceRefs ?? [],
+    ...(aboutRef === undefined ? {} : { aboutRef }),
+  };
+}
+
+function createCustomProperties(create: SemanticCreateInput): PropertyMap {
+  const properties = { ...(create.properties ?? {}) };
+  delete properties.source_refs;
+  delete properties.about_ref;
+  return properties;
 }
 
 function assertAllowedProperties(properties: PropertyMap | undefined): void {
@@ -544,6 +575,146 @@ function edgeProperties(
   };
 }
 
+function canonicalCreates(
+  input: CommitSemanticDeltaInput,
+  allocatedIds: Record<string, string>,
+  revision: number,
+): PlannedVertex[] {
+  const result: PlannedVertex[] = [];
+  const seenIds = new Set<string>();
+  for (const create of input.creates) {
+    const customProperties = createCustomProperties(create);
+    assertAllowedProperties(customProperties);
+    const id = create.id ?? resolveReference(create.ref ?? "", allocatedIds);
+    if (seenIds.has(id)) {
+      throw new SemanticFailure(
+        "VALIDATION_ERROR",
+        `Create id ${id} is duplicated.`,
+        false,
+      );
+    }
+    seenIds.add(id);
+    const references = normalizedCreateReferences(create);
+    const sourceRefs = references.sourceRefs.map((reference) =>
+      resolveReference(reference, allocatedIds),
+    );
+    const aboutRef =
+      references.aboutRef === undefined
+        ? undefined
+        : resolveReference(references.aboutRef, allocatedIds);
+    result.push({
+      id,
+      graphLabel: create.graph_label ?? DEFAULT_SEMANTIC_GRAPH_LABEL,
+      properties: {
+        ...customProperties,
+        object_type: create.object_type,
+        ...(create.label === undefined ? {} : { label: create.label }),
+        ...(create.canonical === undefined
+          ? {}
+          : { canonical: create.canonical }),
+        ...(create.decision_state === undefined
+          ? {}
+          : { decision_state: create.decision_state }),
+        ...(create.epistemic_class === undefined
+          ? {}
+          : { epistemic_class: create.epistemic_class }),
+        ...(create.sensitivity === undefined
+          ? {}
+          : { sensitivity: create.sensitivity }),
+        ...(sourceRefs.length === 0 ? {} : { source_refs: sourceRefs }),
+        ...(aboutRef === undefined ? {} : { about_ref: aboutRef }),
+        major_version: 0,
+        origin_identity: input.origin.identity,
+        origin_actor: input.origin.actor,
+        origin_context: input.origin.context,
+        authoritative_operation_id: input.operation_id,
+        authoritative_revision: revision,
+        authority_epoch: input.authority_epoch,
+      },
+    });
+  }
+  return result;
+}
+
+function canonicalRelationships(
+  input: CommitSemanticDeltaInput,
+  allocatedIds: Record<string, string>,
+  revision: number,
+): PlannedRelationship[] {
+  const relationships: PlannedRelationship[] = [];
+  const seen = new Map<string, PlannedRelationship>();
+  for (const relationship of input.relationships) {
+    const out = resolveReference(relationship.out, allocatedIds);
+    const incoming = resolveReference(relationship.in, allocatedIds);
+    const id =
+      relationship.id ?? relationshipId(out, relationship.label, incoming);
+    if (relationship.ref) {
+      if (
+        allocatedIds[relationship.ref] &&
+        allocatedIds[relationship.ref] !== id
+      ) {
+        throw new SemanticFailure(
+          "VALIDATION_ERROR",
+          `Temporary reference ${relationship.ref} is duplicated.`,
+          false,
+        );
+      }
+      allocatedIds[relationship.ref] = id;
+    }
+    addRelationship(relationships, seen, {
+      id,
+      out,
+      label: relationship.label,
+      in: incoming,
+      properties: edgeProperties(
+        input,
+        revision,
+        relationship.label,
+        relationship.properties,
+      ),
+    });
+  }
+  for (const create of input.creates) {
+    const out = create.id ?? resolveReference(create.ref ?? "", allocatedIds);
+    const references = normalizedCreateReferences(create);
+    for (const sourceRef of references.sourceRefs) {
+      const incoming = resolveReference(sourceRef, allocatedIds);
+      const label = "source";
+      addRelationship(relationships, seen, {
+        id: relationshipId(out, label, incoming),
+        out,
+        label,
+        in: incoming,
+        properties: edgeProperties(input, revision, label, undefined),
+      });
+    }
+    if (references.aboutRef !== undefined) {
+      const incoming = resolveReference(references.aboutRef, allocatedIds);
+      const label = "about";
+      addRelationship(relationships, seen, {
+        id: relationshipId(out, label, incoming),
+        out,
+        label,
+        in: incoming,
+        properties: edgeProperties(input, revision, label, undefined),
+      });
+    }
+  }
+  for (const supersession of input.supersessions) {
+    const out = resolveReference(supersession.newer, allocatedIds);
+    const incoming = resolveReference(supersession.older, allocatedIds);
+    const label = "supersedes";
+    addRelationship(relationships, seen, {
+      id: relationshipId(out, label, incoming),
+      out,
+      label,
+      in: incoming,
+      properties: edgeProperties(input, revision, label, undefined),
+    });
+  }
+  return relationships;
+}
+
 async function buildPlan(
   input: CommitSemanticDeltaInput,
   state: GraphSnapshot,
@@ -564,68 +735,23 @@ async function buildPlan(
     projection: before.projection + (input.revision_effect.projection ? 1 : 0),
   };
 
-  const creates: PlannedVertex[] = [];
-  const createIds = new Set<string>();
-  for (const create of input.creates) {
-    assertAllowedProperties(create.properties);
-    const id = create.id ?? resolveReference(create.ref ?? "", allocatedIds);
-    if (createIds.has(id)) {
-      throw new SemanticFailure(
-        "VALIDATION_ERROR",
-        `Create id ${id} is duplicated.`,
-        false,
-      );
-    }
-    createIds.add(id);
-    const graphLabel = create.graph_label ?? create.label ?? create.object_type;
-    creates.push({
-      id,
-      graphLabel,
-      properties: {
-        ...(create.properties ?? {}),
-        object_type: create.object_type,
-        ...(create.canonical === undefined
-          ? {}
-          : { canonical: create.canonical }),
-        ...(create.decision_state === undefined
-          ? {}
-          : { decision_state: create.decision_state }),
-        ...(create.epistemic_class === undefined
-          ? {}
-          : { epistemic_class: create.epistemic_class }),
-        ...(create.sensitivity === undefined
-          ? {}
-          : { sensitivity: create.sensitivity }),
-        major_version: 0,
-        origin_identity: input.origin.identity,
-        origin_actor: input.origin.actor,
-        origin_context: input.origin.context,
-        authoritative_operation_id: input.operation_id,
-        authoritative_revision: after.semantic,
-        authority_epoch: input.authority_epoch,
-      },
-    });
-  }
+  const creates = canonicalCreates(input, allocatedIds, after.semantic);
+  const createIds = new Set(creates.map((create) => create.id));
+  const relationships = canonicalRelationships(
+    input,
+    allocatedIds,
+    after.semantic,
+  );
 
   const updateIds = [
     ...new Set(input.property_updates.map((update) => update.id)),
   ];
-  const endpointIds = new Set<string>();
-  for (const relationship of input.relationships) {
-    endpointIds.add(resolveReference(relationship.out, allocatedIds));
-    endpointIds.add(resolveReference(relationship.in, allocatedIds));
-  }
-  for (const supersession of input.supersessions) {
-    endpointIds.add(resolveReference(supersession.newer, allocatedIds));
-    endpointIds.add(resolveReference(supersession.older, allocatedIds));
-  }
-  for (const create of input.creates) {
-    for (const source of create.source_refs ?? []) {
-      endpointIds.add(resolveReference(source, allocatedIds));
-    }
-    if (create.about_ref)
-      endpointIds.add(resolveReference(create.about_ref, allocatedIds));
-  }
+  const endpointIds = new Set(
+    relationships.flatMap((relationship) => [
+      relationship.out,
+      relationship.in,
+    ]),
+  );
   const existingNeeded = [...new Set([...updateIds, ...endpointIds])].filter(
     (id) => !createIds.has(id),
   );
@@ -637,9 +763,10 @@ async function buildPlan(
     const existing = existingVertices.get(id);
     if (!existing) {
       throw new SemanticFailure(
-        "VALIDATION_ERROR",
+        "REFERENCE_NOT_FOUND",
         `Referenced semantic object ${id} does not exist.`,
         false,
+        { id },
       );
     }
     if (firstValue(existing, "major_version") !== 0) {
@@ -744,79 +871,6 @@ async function buildPlan(
     updates.push({ id: update.id, expected, set: stampedSet });
   }
 
-  const relationships: PlannedRelationship[] = [];
-  const seenRelationships = new Map<string, PlannedRelationship>();
-  for (const relationship of input.relationships) {
-    const out = resolveReference(relationship.out, allocatedIds);
-    const incoming = resolveReference(relationship.in, allocatedIds);
-    const id =
-      relationship.id ?? relationshipId(out, relationship.label, incoming);
-    if (relationship.ref) {
-      if (
-        allocatedIds[relationship.ref] &&
-        allocatedIds[relationship.ref] !== id
-      ) {
-        throw new SemanticFailure(
-          "VALIDATION_ERROR",
-          `Temporary reference ${relationship.ref} is duplicated.`,
-          false,
-        );
-      }
-      allocatedIds[relationship.ref] = id;
-    }
-    addRelationship(relationships, seenRelationships, {
-      id,
-      out,
-      label: relationship.label,
-      in: incoming,
-      properties: edgeProperties(
-        input,
-        after.semantic,
-        relationship.label,
-        relationship.properties,
-      ),
-    });
-  }
-
-  for (const create of input.creates) {
-    const out = create.id ?? resolveReference(create.ref ?? "", allocatedIds);
-    for (const sourceRef of create.source_refs ?? []) {
-      const incoming = resolveReference(sourceRef, allocatedIds);
-      const label = "source";
-      addRelationship(relationships, seenRelationships, {
-        id: relationshipId(out, label, incoming),
-        out,
-        label,
-        in: incoming,
-        properties: edgeProperties(input, after.semantic, label, undefined),
-      });
-    }
-    if (create.about_ref) {
-      const incoming = resolveReference(create.about_ref, allocatedIds);
-      const label = "about";
-      addRelationship(relationships, seenRelationships, {
-        id: relationshipId(out, label, incoming),
-        out,
-        label,
-        in: incoming,
-        properties: edgeProperties(input, after.semantic, label, undefined),
-      });
-    }
-  }
-
-  for (const supersession of input.supersessions) {
-    const out = resolveReference(supersession.newer, allocatedIds);
-    const incoming = resolveReference(supersession.older, allocatedIds);
-    const label = "supersedes";
-    addRelationship(relationships, seenRelationships, {
-      id: relationshipId(out, label, incoming),
-      out,
-      label,
-      in: incoming,
-      properties: edgeProperties(input, after.semantic, label, undefined),
-    });
-  }
-
   return {
     operationId: input.operation_id,
     receiptId: receiptId(input.operation_id),
@@ -895,14 +949,137 @@ function pushMismatch(mismatches: string[], value: string): void {
   if (mismatches.length < 100) mismatches.push(value);
 }
 
+type CanonicalExpectations = {
+  input: CommitSemanticDeltaInput;
+  allocatedIds: Record<string, string>;
+  allocatorAfter: Record<string, string>;
+  creates: PlannedVertex[];
+  relationships: PlannedRelationship[];
+};
+
+function canonicalExpectations(
+  plan: SemanticOperationPlan,
+): CanonicalExpectations {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(plan.canonicalPayloadJson);
+  } catch {
+    throw new SemanticFailure(
+      "MANUAL_REPAIR_REQUIRED",
+      "The operation receipt canonical payload is not valid JSON.",
+      false,
+      { operation_id: plan.operationId },
+    );
+  }
+  const parsed = commitSemanticDeltaInputSchema.safeParse(decoded);
+  if (!parsed.success || parsed.data.operation_id !== plan.operationId) {
+    throw new SemanticFailure(
+      "MANUAL_REPAIR_REQUIRED",
+      "The operation receipt canonical payload does not satisfy the current semantic contract.",
+      false,
+      { operation_id: plan.operationId },
+    );
+  }
+  const input = parsed.data;
+  const allocation = buildAllocations(input, plan.allocatorBefore);
+  const revision =
+    input.expected.semantic_revision + (input.revision_effect.semantic ? 1 : 0);
+  const creates = canonicalCreates(input, allocation.allocatedIds, revision);
+  const relationships = canonicalRelationships(
+    input,
+    allocation.allocatedIds,
+    revision,
+  );
+  return {
+    input,
+    allocatedIds: allocation.allocatedIds,
+    allocatorAfter: allocation.allocatorAfter,
+    creates,
+    relationships,
+  };
+}
+
+function canonicalPlanMismatches(plan: SemanticOperationPlan): string[] {
+  const expected = canonicalExpectations(plan);
+  const mismatches: string[] = [];
+  const expectedPayload = canonicalPayload(expected.input);
+  if (plan.canonicalPayloadHash !== expectedPayload.hash) {
+    pushMismatch(mismatches, "canonical payload hash");
+  }
+  if (plan.receiptId !== receiptId(expected.input.operation_id)) {
+    pushMismatch(mismatches, "operation receipt id");
+  }
+  if (plan.authorityEpoch !== expected.input.authority_epoch) {
+    pushMismatch(mismatches, "operation authority epoch");
+  }
+  if (canonicalize(plan.origin) !== canonicalize(expected.input.origin)) {
+    pushMismatch(mismatches, "operation origin");
+  }
+  if (
+    plan.revisions.before.semantic !==
+      expected.input.expected.semantic_revision ||
+    (expected.input.expected.graph_revision !== undefined &&
+      plan.revisions.before.graph !== expected.input.expected.graph_revision) ||
+    (expected.input.expected.projection_revision !== undefined &&
+      plan.revisions.before.projection !==
+        expected.input.expected.projection_revision)
+  ) {
+    pushMismatch(mismatches, "operation starting revisions");
+  }
+  const expectedAfter: SemanticRevisionSet = {
+    semantic:
+      plan.revisions.before.semantic +
+      (expected.input.revision_effect.semantic ? 1 : 0),
+    graph:
+      plan.revisions.before.graph +
+      (expected.input.revision_effect.graph ? 1 : 0),
+    projection:
+      plan.revisions.before.projection +
+      (expected.input.revision_effect.projection ? 1 : 0),
+  };
+  if (canonicalize(plan.revisions.after) !== canonicalize(expectedAfter)) {
+    pushMismatch(mismatches, "operation resulting revisions");
+  }
+  if (canonicalize(plan.allocatedIds) !== canonicalize(expected.allocatedIds)) {
+    pushMismatch(mismatches, "allocated ids");
+  }
+  if (
+    canonicalize(plan.allocatorAfter) !== canonicalize(expected.allocatorAfter)
+  ) {
+    pushMismatch(mismatches, "allocator result");
+  }
+  if (canonicalize(plan.creates) !== canonicalize(expected.creates)) {
+    pushMismatch(mismatches, "canonical semantic creates");
+  }
+  if (
+    canonicalize(plan.relationships) !== canonicalize(expected.relationships)
+  ) {
+    pushMismatch(mismatches, "canonical semantic relationships");
+  }
+  return mismatches;
+}
+
+function assertCanonicalPlan(plan: SemanticOperationPlan): void {
+  const mismatches = canonicalPlanMismatches(plan);
+  if (mismatches.length > 0) {
+    throw new SemanticFailure(
+      "MANUAL_REPAIR_REQUIRED",
+      "The durable operation plan does not match canonical major-version-0 serialization.",
+      false,
+      { operation_id: plan.operationId, mismatches },
+    );
+  }
+}
+
 async function verifyPlan(
   plan: SemanticOperationPlan,
   backend: SemanticOperationBackend,
   requestId: string,
 ): Promise<Verification> {
+  const canonical = canonicalExpectations(plan);
   const vertexIds = [
     plan.receiptId,
-    ...plan.creates.map((value) => value.id),
+    ...canonical.creates.map((value) => value.id),
     ...plan.updates.map((value) => value.id),
   ];
   const vertices = await backend.readVertices(
@@ -910,7 +1087,7 @@ async function verifyPlan(
     requestId,
   );
   const edges = await backend.readEdges(
-    plan.relationships.map((relationship) => relationship.id),
+    canonical.relationships.map((relationship) => relationship.id),
     requestId,
   );
   const state = await backend.readGraphState(
@@ -925,13 +1102,13 @@ async function verifyPlan(
   ) {
     pushMismatch(mismatches, "operation receipt identity");
   }
-  for (const create of plan.creates) {
+  for (const create of canonical.creates) {
     const actual = vertices.get(create.id);
     if (!actual) {
       pushMismatch(mismatches, `missing vertex ${create.id}`);
       continue;
     }
-    if (firstValue(actual, "label") !== create.graphLabel) {
+    if (firstValue(actual, INTERNAL_GRAPH_LABEL_KEY) !== create.graphLabel) {
       pushMismatch(mismatches, `vertex label ${create.id}`);
     }
     for (const [key, expected] of Object.entries(create.properties)) {
@@ -952,7 +1129,7 @@ async function verifyPlan(
       }
     }
   }
-  for (const relationship of plan.relationships) {
+  for (const relationship of canonical.relationships) {
     const actual = edges.get(relationship.id);
     if (!actual) {
       pushMismatch(mismatches, `missing relationship ${relationship.id}`);
@@ -999,9 +1176,9 @@ async function verifyPlan(
   return {
     verified: mismatches.length === 0,
     mismatches,
-    expectedVertices: 1 + plan.creates.length + plan.updates.length,
+    expectedVertices: 1 + canonical.creates.length + plan.updates.length,
     actualVertices: vertices.size,
-    expectedEdges: plan.relationships.length,
+    expectedEdges: canonical.relationships.length,
     actualEdges: edges.size,
   };
 }
@@ -1096,6 +1273,7 @@ export function createSemanticOperations(
     requestId: string,
     status: CommitSemanticDeltaResult["status"],
   ): Promise<SemanticOperationResult> => {
+    assertCanonicalPlan(plan);
     logTransition(requestId, plan.operationId, "verify");
     const verification = await verifyPlan(plan, backend, requestId);
     if (!verification.verified) {
@@ -1169,6 +1347,7 @@ export function createSemanticOperations(
     completeStatus: CommitSemanticDeltaResult["status"] = "recovered_complete",
   ): Promise<SemanticOperationResult> => {
     const plan = planFromReceipt(receipt);
+    assertCanonicalPlan(plan);
     if (receipt.payloadHash !== plan.canonicalPayloadHash) {
       throw new SemanticFailure(
         "MANUAL_REPAIR_REQUIRED",
@@ -1250,7 +1429,7 @@ export function createSemanticOperations(
       const actual = vertices.get(create.id);
       if (!actual) continue;
       if (
-        firstValue(actual, "label") !== create.graphLabel ||
+        firstValue(actual, INTERNAL_GRAPH_LABEL_KEY) !== create.graphLabel ||
         Object.entries(create.properties).some(
           ([key, expected]) => !semanticValuesEqual(actual[key], expected),
         )
@@ -1364,6 +1543,7 @@ export function createSemanticOperations(
         ensureAuthorityAndRevision(input, state);
         logTransition(requestId, input.operation_id, "plan");
         const plan = await buildPlan(input, state, backend, requestId, now);
+        assertCanonicalPlan(plan);
         logger.info({
           component: "mcp",
           event: "semantic_operation_plan_ready",
@@ -1684,6 +1864,7 @@ function controlUpdateStatements(plan: SemanticOperationPlan): string[] {
 }
 
 function newOperationQuery(plan: SemanticOperationPlan): string {
+  const createIds = new Set(plan.creates.map((create) => create.id));
   const guards = [
     guardExists(
       "sol:authority",
@@ -1708,8 +1889,10 @@ function newOperationQuery(plan: SemanticOperationPlan): string {
     ...plan.creates.map((create) => guardAbsent(create.id)),
     ...plan.updates.map(expectedGuard),
     ...plan.relationships.flatMap((relationship) => [
-      guardExists(relationship.out),
-      guardExists(relationship.in),
+      ...(createIds.has(relationship.out)
+        ? []
+        : [guardExists(relationship.out)]),
+      ...(createIds.has(relationship.in) ? [] : [guardExists(relationship.in)]),
       guardAbsent(relationship.id, true),
     ]),
   ];
@@ -1733,6 +1916,7 @@ function recoveryQuery(
   plan: SemanticOperationPlan,
   state: GraphSnapshot,
 ): string {
+  const createIds = new Set(plan.creates.map((create) => create.id));
   const guards = [
     guardExists(
       "sol:authority",
@@ -1757,8 +1941,10 @@ function recoveryQuery(
     ),
     ...plan.updates.map((update) => guardExists(update.id)),
     ...plan.relationships.flatMap((relationship) => [
-      guardExists(relationship.out),
-      guardExists(relationship.in),
+      ...(createIds.has(relationship.out)
+        ? []
+        : [guardExists(relationship.out)]),
+      ...(createIds.has(relationship.in) ? [] : [guardExists(relationship.in)]),
     ]),
   ];
   const creates = plan.creates.map(
@@ -1996,11 +2182,29 @@ export function createGremlinSemanticBackend(
     async readVertices(ids, requestId) {
       if (ids.length === 0) return new Map();
       const data = await execute(
-        `g.V(${ids.map((id) => JSON.stringify(id)).join(",")}).valueMap(true)`,
+        `g.V(${ids.map((id) => JSON.stringify(id)).join(",")}).project('id','graph_label','properties').by(id()).by(label()).by(valueMap())`,
         requestId,
         false,
       );
-      return recordsById(data);
+      const result = new Map<string, UnknownRecord>();
+      for (const item of data) {
+        const projected = asRecord(item);
+        const id = projected ? firstValue(projected, "id") : undefined;
+        const graphLabel = projected
+          ? firstValue(projected, "graph_label")
+          : undefined;
+        const properties = projected
+          ? asRecord(projected.properties)
+          : undefined;
+        if (typeof id === "string" && typeof graphLabel === "string") {
+          result.set(id, {
+            id,
+            [INTERNAL_GRAPH_LABEL_KEY]: graphLabel,
+            ...(properties ?? {}),
+          });
+        }
+      }
+      return result;
     },
 
     async readEdges(ids, requestId) {
