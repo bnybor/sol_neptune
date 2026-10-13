@@ -56,7 +56,7 @@ import {
 } from "./semantic-operations.js";
 
 export const SERVER_INSTRUCTIONS =
-  "This server exposes Sol's private structural graph through typed semantic operations and separate read, non-destructive write, and destructive-delete Gremlin tools. Prefer search_gremlin for reads: it returns one typed GraphSON meta-graph, with depth 0 for unexpanded results, default depth 3, maximum depth 7, and a read-only blacklist query. Every connection costs two hops. Query positions preserve result order and repetition. Check search.complete and unresolved_folds; size or execution limits fail without returning a partial graph. read_gremlin is a deprecated compatibility read. All query inputs are limited to 262,144 UTF-8 bytes. Use get_current_time for fresh server UTC and epoch time. Prefer guarded typed operations for routine semantic persistence. Use write_gremlin only for explicitly requested additions or updates and delete_gremlin only for explicitly requested removals. Never retry an unknown mutation outcome blindly.";
+  "This server exposes Sol's private structural graph through typed semantic operations and separate read, non-destructive write, and destructive-delete Gremlin tools. Prefer search_gremlin for reads: it returns one complete typed meta-graph in compact v1 by default; format=graphson requests the original GraphSON 3 representation. Compact responses include literal dictionary definitions and an unambiguous tagged-JSON grammar; the full graph is directly in context, and search metadata stays literal. Depth 0 gives unexpanded results, default depth is 3, maximum is 7, with a read-only blacklist query. Every connection costs two hops. Query positions preserve result order and repetition. Check search.complete and unresolved_folds; size or execution limits fail without returning a partial graph. read_gremlin is a deprecated compatibility read. All query inputs are limited to 262,144 UTF-8 bytes. Use get_current_time for fresh server UTC and epoch time. Prefer guarded typed operations for routine semantic persistence. Use write_gremlin only for explicitly requested additions or updates and delete_gremlin only for explicitly requested removals. Never retry an unknown mutation outcome blindly.";
 
 const queryInput = z
   .object({
@@ -116,7 +116,7 @@ export const searchGremlinTool = {
   name: "search_gremlin",
   title: "Search Gremlin with graph context",
   description:
-    "Execute a verified read-only query and return one typed GraphSON 3 meta-graph. Vertex-edge-vertex, body references and explicit g0 shaped_like correspondences each cost two hops. Depth minimum 0, default 3, maximum 7. Initial meta-nodes retain all query positions; expansion-only nodes have none. Reached blacklist matches remain visible but do not expand. Scalars and compound values are terminals. Successful expansion is fenced by an unchanged Neptune stream head. Ambiguous folds are reported in search.unresolved_folds with search.complete=false; resource limits fail without a partial result.",
+    "Execute a verified read-only query and return one complete typed meta-graph. Format defaults to compact: tagged JSON, a literal response-local dictionary, and decoding grammar, with all data directly in context. Use format=graphson for original GraphSON 3. Search metadata stays literal. Vertex-edge-vertex, body references and explicit g0 shaped_like correspondences each cost two hops. Depth minimum 0, default 3, maximum 7. Initial meta-nodes retain all query positions; expansion-only nodes have none. Reached blacklist matches remain visible but do not expand. Scalars and compound values are terminals. Successful expansion is fenced by an unchanged Neptune stream head. Ambiguous folds are reported in search.unresolved_folds with search.complete=false; resource limits fail without a partial result.",
   inputSchema: {
     type: "object",
     additionalProperties: false,
@@ -133,6 +133,13 @@ export const searchGremlinTool = {
         minimum: 0,
         default: DEFAULT_SEARCH_DEPTH,
         maximum: MAX_SEARCH_DEPTH,
+      },
+      format: {
+        type: "string",
+        enum: ["compact", "graphson"],
+        default: "compact",
+        description:
+          "Compact v1 returns the complete typed graph as tagged JSON with a literal response-local dictionary and decoding grammar. Select graphson for the original GraphSON 3 representation. Search metadata remains literal in either format.",
       },
     },
   },
@@ -526,6 +533,7 @@ export function createMcpServer(dependencies: ServerDependencies): Server {
         }
         searchOptions = {
           depth: search.depth,
+          format: search.format ?? "compact",
           ...(search.blacklist_query === undefined
             ? {}
             : { blacklist_query: search.blacklist_query }),

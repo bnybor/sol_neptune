@@ -53,6 +53,37 @@ function padded(base: string, size: number): string {
 }
 
 describe("search and clock MCP protocol", () => {
+  it.each(["compact", "graphson"])(
+    "passes explicit %s format through",
+    async (format) => {
+      const { call, invokeExecutor } = setup();
+      expect(
+        (
+          await call("search_gremlin", {
+            query: "g.V().limit(1)",
+            depth: 0,
+            format,
+          })
+        ).result.isError,
+      ).toBe(false);
+      expect(invokeExecutor).toHaveBeenLastCalledWith(
+        "g.V().limit(1)",
+        expect.any(String),
+        { search: { depth: 0, format } },
+      );
+    },
+  );
+  it.each([null, 1, "binary", "GraphSON"])(
+    "rejects invalid format %s before execution",
+    async (format) => {
+      const { call, invokeExecutor } = setup();
+      expect(
+        (await call("search_gremlin", { query: "g.V()", format })).result
+          .structuredContent,
+      ).toMatchObject({ error: { code: "QUERY_INVALID" } });
+      expect(invokeExecutor).not.toHaveBeenCalled();
+    },
+  );
   it("passes default 3 and accepted depth boundaries through to the private executor", async () => {
     const { call, invokeExecutor } = setup();
     for (const depth of [undefined, 0, 7]) {
@@ -64,7 +95,7 @@ describe("search and clock MCP protocol", () => {
       expect(invokeExecutor).toHaveBeenLastCalledWith(
         "g.V().limit(1)",
         expect.any(String),
-        { search: { depth: depth ?? 3 } },
+        { search: { depth: depth ?? 3, format: "compact" } },
       );
     }
   });
@@ -138,7 +169,7 @@ describe("search and clock MCP protocol", () => {
     expect(invokeExecutor).toHaveBeenLastCalledWith(
       "g.V()",
       expect.any(String),
-      { search: { depth: 3, blacklist_query: blacklist } },
+      { search: { depth: 3, format: "compact", blacklist_query: blacklist } },
     );
     expect(
       (

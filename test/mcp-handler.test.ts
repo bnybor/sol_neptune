@@ -63,6 +63,7 @@ describe("MCP Lambda handler", () => {
       inputSchema: {
         properties: {
           depth: { minimum: 0, default: 3, maximum: 7 },
+          format: { enum: ["compact", "graphson"], default: "compact" },
           query: { maxLength: MAX_QUERY_BYTES },
           blacklist_query: { maxLength: MAX_QUERY_BYTES },
         },

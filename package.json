@@ -1,6 +1,6 @@
 {
   "name": "sol-neptune-gremlin-mcp",
-  "version": "2.2.1",
+  "version": "2.3.0",
   "private": true,
   "type": "module",
   "description": "OAuth-protected MCP access to Sol's private Amazon Neptune graph.",
@@ -22,6 +22,7 @@
     "@aws-sdk/client-neptunedata": "3.1137.0",
     "@modelcontextprotocol/sdk": "1.30.0",
     "@smithy/node-http-handler": "4.12.1",
+    "gpt-tokenizer": "4.0.0",
     "jose": "6.2.12",
     "zod": "4.6.5"
   },

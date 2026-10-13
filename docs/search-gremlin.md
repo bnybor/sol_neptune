@@ -1,6 +1,6 @@
-# g0 MCP search contract — 2.2.1
+# g0 MCP search contract — 2.3.0
 
-This implements the October 13, 2026 discussion (Neptune S1003101–S1003125), amended in Codex to cap depth at 7. The endpoint remains the existing g0 MCP endpoint. The change includes automatic neighborhood search, a 256 KiB query limit across functions, and an independent server-clock tool. Implementation in this checkout does not imply production deployment.
+This implements the October 13, 2026 search discussion (Neptune S1003101–S1003125), amended in Codex to cap depth at 7, and the evening compact-format handoff (S1003154–S1003159; scratch:20261013T222207Z:compact-search-codex-handoff). The endpoint remains the existing g0 MCP endpoint. Version 2.3.0 adds a complete lossless compact representation selected by default, with explicit GraphSON compatibility. Implementation in this checkout does not imply production deployment.
 
 ## Input
 
@@ -8,17 +8,64 @@ This implements the October 13, 2026 discussion (Neptune S1003101–S1003125), a
 {
   "query": "g.V('S1003101')",
   "blacklist_query": "g.V('N1001','N1002')",
-  "depth": 3
+  "depth": 3,
+  "format": "compact"
 }
 ```
 
 `query` is required. `blacklist_query` is optional; omission means no blacklist. Both must pass the same conservative read-only classifier as the original read tool. `depth` is an integer from **0 through 7**, default **3**. Unknown parameters, mutation steps in either query, and unsupported syntax are rejected before execution. The private executor repeats validation independently.
 
+`format` is **compact** when omitted, or **graphson** to request the original GraphSON 3 result. Callers that directly parse GraphSON must opt in explicitly. Invalid formats fail before graph access in both Lambdas. The format never changes traversals, identities, depth, blacklist behavior, folds, consistency or completeness.
+
 Every caller-supplied query is limited separately to **262,144 UTF-8 bytes**, including both search queries and raw read/write/delete. Generated semantic-commit and internal search queries use the same limit. JSON Schema advertises a character upper bound; runtime UTF-8 byte validation is authoritative. Per-property and item-count limits in semantic inputs retain their separate meanings.
 
-## Result and typed identity
+## Compact v1 wire format
 
-The usual successful execution envelope contains `result.graphson_version="3.0"`, `result.graph`, and `result.search`. `graph` is a GraphSON `g:Map` containing `vertices` and `edges` as typed lists of `g:Vertex` meta-nodes and `g:Edge` hops. It is **one graph**, with no separate raw-results field. The outer execution envelope retains request ID, elapsed time, byte count and existing retry metadata.
+The successful execution envelope keeps `ok`, request ID, elapsed time, byte count and retry metadata. `result` contains `format="compact"`, `compact_version=1`, `graphson_version="3.0"`, the decoding `encoding` sentence, a response-local `dictionary`, encoded `graph`, and literal `search` metadata. All dictionary definitions precede graph data. No user extraction tool, filtering, binary transport or payload compression is part of this format.
+
+The shared dictionary contains **literal strings**. Keys and values choose references independently, so a string may be referenced as a key while remaining literal as a value. GraphSON numeric widths and other types stay explicit in typed records; they are never normalized to plain JSON. Dictionary entries are never themselves decoded, and references never chain. Source prose is not split into fragments.
+
+| Encoded form             | Exact meaning                                                                                               |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------- |
+| Scalar                   | Literal string, finite number, boolean or null                                                              |
+| Untagged array           | Literal array with recursively decoded children                                                             |
+| `["a", ...items]`        | Escaped literal array, used when its first original item is a reserved tag (`a`, `t`, `o`, `r`, `n`)        |
+| `["t", type, value]`     | GraphSON object `{"@type": decodedType, "@value": decodedValue}`                                            |
+| `["o", key, value, ...]` | Object; each key is independently a literal string or a numeric dictionary index; values decode recursively |
+| `["r", i]`               | Exact literal string `dictionary[i]`                                                                        |
+| `["r", i, suffix]`       | That literal string plus the explicitly provided literal suffix                                             |
+| `["n", "-0"]`            | Negative zero                                                                                               |
+
+Only synthetic search identity fields (`id`, `outV`, `inV`) use suffix factoring: the repeated `search:<kind>:<64-hex-hash>` prefix is defined once, and property suffixes remain explicit. This performs one lookup and preserves every original full ID. Ordinary reference-looking arrays/objects are escaped, so data can never be mistaken for an instruction. Arbitrary GraphSON map keys, collection distinctions, property cardinality, unknown type tags, field presence and query positions survive exact reconstruction. The decoder/verifier is in `src/shared/compact-graphson.ts`; it is a library/testing helper, not another MCP tool.
+
+Dictionary planning uses conservative **o200k_base** token costs with definition/reference overhead, and retains the complete dictionary only when the full encoded graph object is cheaper than the same grammar without interning. Different providers have different tokenization. No universal savings guarantee is implied. `gpt-tokenizer@4.0.0` is pinned; source strings resembling special tokens are counted as ordinary text.
+
+Both the existing pre-encoding GraphSON bounds and the selected complete response envelope must fit their original size limits. `meta.result_bytes` measures the selected encoded result, excluding the outer envelope. Compact does not admit a search that previously exceeded a query, node, hop, position, reference, time or raw GraphSON size bound. Encoding counts against the same search deadline. An encoded response that exceeds 1 MiB fails without a partial graph.
+
+## Native snapshot measurements
+
+Eight scenarios used 31 actual TinkerPop 3.8.2 queries against one verified, separately loaded g0 mirror snapshot: cursor **174:11**, 11,563 vertices and 17,308 edges. Snapshot source fingerprint `a3e39b2a202d9cf8aed3949acb8ee78a92fc695867dffd3bea068242ed4ebfd1`; GraphSON SHA256 `7efbfe92ca072778e0e242365871c1d361d81bd4e8886b69cc0f30059d5a1ca5`. Captured-query SHA256 `909b35cecc349a07669c2c043c44453c848397fcb10fc93a08c0c622b2ed38a0`. The experiment ran on the Sol box so the SSH text redactor could not substitute operation IDs. Both encodings used identical captured typed results.
+
+Counts include the minified **complete execution envelope**, grammar, dictionary, search metadata and byte metadata. These are named-tokenizer measurements, not byte percentages or estimates of every model's context. All eight cases passed exact typed-tree reconstruction, preserving field presence and order while ignoring JavaScript object-prototype choices that JSON does not encode.
+
+| Scenario                              | GraphSON o200k | Compact o200k | GraphSON cl100k | Compact cl100k |
+| ------------------------------------- | -------------: | ------------: | --------------: | -------------: |
+| Scalar count, depth 0                 |            713 |           578 |             702 |            577 |
+| Repeated scalars, depth 0             |          2,496 |         1,570 |           2,450 |          1,568 |
+| 12-thread working-set projection      |         18,956 |        15,523 |          18,829 |         15,568 |
+| Two source-text vertices              |          4,284 |         3,854 |           4,223 |          3,852 |
+| Compound projected maps               |          1,473 |         1,065 |           1,438 |          1,059 |
+| Expanded source, depth 2              |         26,472 |        20,467 |          26,210 |         20,457 |
+| Edge neighborhood, 123 nodes/128 hops |        124,599 |        82,107 |         123,277 |         82,053 |
+| Fold neighborhood, depth 1            |         18,690 |        14,181 |          18,357 |         14,163 |
+
+Encoding in this single Sol-box run took 3.8–442.2 ms, excluding query acquisition; the first scalar case includes tokenizer initialization. These are individual samples, not p95 or Lambda performance guarantees. Prose-heavy output naturally saves less. Mirror component-label semantics and streamed vertex-property IDs differ from Neptune; this verifies serialization against real engineering input, not production deployment or provider-query equivalence.
+
+Reproduce with `scripts/benchmark-compact.mjs PRIVATE_DIRECTORY`: it uses hash-identifiable captured native query results in `captured.json` and the verified snapshot's `manifest.json`. For fresh capture, add `--native-jar /path/to/g0-mirror.jar --runner /path/to/scripts/CompactSnapshotRunner.java --snapshot /path/to/verified/snapshot`. The Java runner verifies the source fingerprint and snapshot before loading a separate private graph. Captures and complete example payloads remain private; only measurements should be published. Use `--reuse-bundles` for prepared benchmark modules on a host without esbuild. Installed package versions must match the pinned repository versions.
+
+## Underlying GraphSON result and typed identity
+
+With `format="graphson"`, the unchanged successful execution result contains `result.graphson_version="3.0"`, `result.graph`, and `result.search`. `graph` is a GraphSON `g:Map` containing `vertices` and `edges` as typed lists of `g:Vertex` meta-nodes and `g:Edge` hops. Compact v1 reconstructs that same complete typed graph. It is **one graph**, with no separate raw-results field. The outer execution envelope retains request ID, elapsed time, byte count and existing retry metadata.
 
 Meta-vertex properties:
 

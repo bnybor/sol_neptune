@@ -8,7 +8,11 @@ import {
   ExecuteGremlinQueryCommand,
   GetPropertygraphStreamCommand,
 } from "@aws-sdk/client-neptunedata";
-import { MAX_QUERY_BYTES } from "../src/shared/contracts.js";
+import {
+  MAX_QUERY_BYTES,
+  MAX_STRUCTURED_RESULT_BYTES,
+} from "../src/shared/contracts.js";
+import { decodeCompactGraphson } from "../src/shared/compact-graphson.js";
 import { typed, required } from "../src/shared/graphson.js";
 const context = { awsRequestId: "lambda-request" };
 const baseEvent = {
@@ -37,6 +41,69 @@ function captureLogger(): {
   };
 }
 describe("private Neptune executor", () => {
+  it("defaults to compact and preserves exact explicit GraphSON results and metadata", async () => {
+    const send = vi.fn().mockResolvedValue({
+      result: { data: typed("g:List", [typed("g:Int64", 42)]) },
+    });
+    const handler = createExecutorHandler({
+      getClient: () => ({ send }) as NeptuneSender,
+      now: () => 1234,
+    });
+    const compact = await handler(
+      { ...baseEvent, query: "g.V().count()", search: { depth: 0 } },
+      context,
+    );
+    const graphson = await handler(
+      {
+        ...baseEvent,
+        query: "g.V().count()",
+        search: { depth: 0, format: "graphson" },
+      },
+      context,
+    );
+    if (!compact.ok || !graphson.ok) throw new Error("Unexpected failure");
+    const c = compact.result as Record<string, unknown>,
+      g = graphson.result as Record<string, unknown>;
+    expect(c.format).toBe("compact");
+    expect(g.format).toBeUndefined();
+    expect(decodeCompactGraphson(JSON.parse(JSON.stringify(c)))).toEqual(
+      g.graph,
+    );
+    expect(c.search).toEqual(g.search);
+    expect(compact.meta.result_bytes).toBe(
+      Buffer.byteLength(JSON.stringify(c)),
+    );
+    expect(graphson.meta.result_bytes).toBe(
+      Buffer.byteLength(JSON.stringify(g)),
+    );
+  });
+  it.each([undefined, "compact", "graphson"])(
+    "keeps the original pre-encoding response limit for format %s",
+    async (format) => {
+      const send = vi.fn().mockResolvedValue({
+        result: {
+          data: typed("g:List", ["x".repeat(MAX_STRUCTURED_RESULT_BYTES)]),
+        },
+      });
+      const handler = createExecutorHandler({
+        getClient: () => ({ send }) as NeptuneSender,
+      });
+      const result = await handler(
+        {
+          ...baseEvent,
+          query: "g.V().values('canonical')",
+          search: { depth: 0, ...(format === undefined ? {} : { format }) },
+        },
+        context,
+      );
+      expect(result).toMatchObject({
+        ok: false,
+        error: { code: "RESULT_TOO_LARGE" },
+      });
+      expect(result).not.toHaveProperty("result");
+      expect(send).toHaveBeenCalledOnce();
+    },
+  );
   it("enforces the 256 KiB UTF-8 query boundary in the private executor", async () => {
     const base = "g.V().limit(0)";
     const bytes = MAX_QUERY_BYTES - Buffer.byteLength(base) - 4;
@@ -176,6 +243,7 @@ describe("private Neptune executor", () => {
   it.each([
     { query: "g.V()", search: { depth: 8 } },
     { query: "g.V()", search: { depth: -1 } },
+    { query: "g.V()", search: { depth: 0, format: "binary" } },
     { query: "g.V().drop()", search: { depth: 0 } },
     { query: "g.V()", search: { blacklist_query: "g.addV('bad')", depth: 3 } },
     {

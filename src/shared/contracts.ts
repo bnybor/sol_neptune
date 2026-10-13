@@ -9,6 +9,7 @@ export const EXECUTOR_SOURCE = "sol-neptune-mcp";
 
 export const searchOptionsSchema = z
   .object({
+    format: z.enum(["compact", "graphson"]).optional(),
     blacklist_query: z.string().min(1).max(MAX_QUERY_BYTES).optional(),
     depth: z
       .number()

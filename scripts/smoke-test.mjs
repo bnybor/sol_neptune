@@ -66,6 +66,11 @@ if (
     ?.maximum !== 7 ||
   discoveredByName.get("search_gremlin")?.inputSchema?.properties?.query
     ?.maxLength !== 262_144 ||
+  discoveredByName.get("search_gremlin")?.inputSchema?.properties?.format
+    ?.default !== "compact" ||
+  !discoveredByName
+    .get("search_gremlin")
+    ?.inputSchema?.properties?.format?.enum?.includes("graphson") ||
   discoveredByName.get("get_current_time")?.annotations?.readOnlyHint !==
     true ||
   discoveredByName.get("read_gremlin")?.annotations?.readOnlyHint !== true ||
@@ -173,7 +178,7 @@ if (token) {
       method: "tools/call",
       params: {
         name: "search_gremlin",
-        arguments: { query: "g.V().count()", depth: 0 },
+        arguments: { query: "g.V().count()", depth: 0, format: "graphson" },
       },
     },
     token,
@@ -186,6 +191,30 @@ if (token) {
     searchResult.result?.search?.query_result_count !== 1
   ) {
     throw new Error("Authenticated typed depth-zero search failed");
+  }
+  const compact = await post(
+    {
+      jsonrpc: "2.0",
+      id: nextId++,
+      method: "tools/call",
+      params: {
+        name: "search_gremlin",
+        arguments: { query: "g.V().count()", depth: 0 },
+      },
+    },
+    token,
+  );
+  const compactResult = compact.body?.result?.structuredContent;
+  if (
+    compactResult?.ok !== true ||
+    compactResult.result?.format !== "compact" ||
+    compactResult.result?.compact_version !== 1 ||
+    !Array.isArray(compactResult.result?.dictionary) ||
+    !Array.isArray(compactResult.result?.graph) ||
+    typeof compactResult.result?.encoding !== "string" ||
+    compactResult.result?.search?.query_result_count !== 1
+  ) {
+    throw new Error("Authenticated default compact depth-zero search failed");
   }
   const expanded = await post(
     {

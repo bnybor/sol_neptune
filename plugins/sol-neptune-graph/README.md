@@ -46,6 +46,13 @@ codex plugin add sol-neptune-graph@sol-neptune-local
 After installing or refreshing the plugin, start a new chat so its skill and
 MCP tools are loaded for that chat.
 
+The 2.3.0 server contract makes `search_gremlin` default to the complete compact
+v1 typed graph. Dictionary definitions and the decoding grammar are included
+in the response; `search` metadata stays literal. Specify `format="graphson"`
+for an existing consumer that directly parses GraphSON 3. Refresh tool metadata
+after deploying this release. Repository changes alone do not update a live
+connection.
+
 The server endpoint and connection identity do not change when the typed tools
 are added. An already configured connection should discover
 `get_graph_state`, `commit_semantic_delta`, and `reconcile_operation` after a

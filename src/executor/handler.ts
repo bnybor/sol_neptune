@@ -25,6 +25,7 @@ import {
 } from "./neptune-client.js";
 import { validateGremlinForTool } from "../mcp/gremlin-safety.js";
 import { SearchFailure, searchGremlin } from "./search.js";
+import { compactSearchResult } from "../shared/compact-graphson.js";
 
 const GREMLIN_SERIALIZER = "application/vnd.gremlin-v3.0+json;types=false";
 
@@ -331,7 +332,20 @@ export function createExecutorHandler(
           },
           { now: deps.now },
         );
-        response = successResponse(result, requestId, deps.now() - startedAt);
+        const formatted =
+          parsed.data.search.format === "graphson"
+            ? result
+            : compactSearchResult(result);
+        if (deps.now() >= deadline)
+          throw new SearchFailure(
+            "QUERY_TIMEOUT",
+            "The search exceeded its execution budget; no partial graph is returned.",
+          );
+        response = successResponse(
+          formatted,
+          requestId,
+          deps.now() - startedAt,
+        );
       } else {
         const output: ExecuteGremlinQueryCommandOutput = await client.send(
           new ExecuteGremlinQueryCommand({
