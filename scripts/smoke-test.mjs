@@ -58,7 +58,16 @@ const tools = await post({
 const discovered = tools.body?.result?.tools ?? [];
 const discoveredByName = new Map(discovered.map((tool) => [tool.name, tool]));
 if (
-  discovered.length !== 7 ||
+  discovered.length !== 9 ||
+  discoveredByName.get("search_gremlin")?.annotations?.readOnlyHint !== true ||
+  discoveredByName.get("search_gremlin")?.inputSchema?.properties?.depth
+    ?.default !== 3 ||
+  discoveredByName.get("search_gremlin")?.inputSchema?.properties?.depth
+    ?.maximum !== 7 ||
+  discoveredByName.get("search_gremlin")?.inputSchema?.properties?.query
+    ?.maxLength !== 262_144 ||
+  discoveredByName.get("get_current_time")?.annotations?.readOnlyHint !==
+    true ||
   discoveredByName.get("read_gremlin")?.annotations?.readOnlyHint !== true ||
   discoveredByName.get("read_gremlin")?.annotations?.destructiveHint !==
     false ||
@@ -77,7 +86,7 @@ if (
     true
 ) {
   throw new Error(
-    "Expected the four existing tools and three typed semantic tools",
+    "Expected seven compatibility/semantic tools plus search_gremlin and get_current_time",
   );
 }
 
@@ -85,7 +94,10 @@ const anonymous = await post({
   jsonrpc: "2.0",
   id: nextId++,
   method: "tools/call",
-  params: { name: "read_gremlin", arguments: { query: "g.V().limit(1)" } },
+  params: {
+    name: "search_gremlin",
+    arguments: { query: "g.V().limit(1)", depth: 0 },
+  },
 });
 if (
   !anonymous.authenticate ||
@@ -154,9 +166,76 @@ if (token) {
   if (authenticated.body?.result?.structuredContent?.ok !== true) {
     throw new Error("Authenticated bounded read failed");
   }
+  const search = await post(
+    {
+      jsonrpc: "2.0",
+      id: nextId++,
+      method: "tools/call",
+      params: {
+        name: "search_gremlin",
+        arguments: { query: "g.V().count()", depth: 0 },
+      },
+    },
+    token,
+  );
+  const searchResult = search.body?.result?.structuredContent;
+  if (
+    searchResult?.ok !== true ||
+    searchResult.result?.graphson_version !== "3.0" ||
+    searchResult.result?.graph?.["@type"] !== "g:Map" ||
+    searchResult.result?.search?.query_result_count !== 1
+  ) {
+    throw new Error("Authenticated typed depth-zero search failed");
+  }
+  const expanded = await post(
+    {
+      jsonrpc: "2.0",
+      id: nextId++,
+      method: "tools/call",
+      params: {
+        name: "search_gremlin",
+        arguments: {
+          query: "g.V('sol:authority')",
+          blacklist_query: "g.V('sol:authority')",
+        },
+      },
+    },
+    token,
+  );
+  const expandedResult = expanded.body?.result?.structuredContent;
+  if (
+    expandedResult?.ok !== true ||
+    expandedResult.result?.search?.consistency !==
+      "unchanged_neptune_stream_head" ||
+    expandedResult.result?.search?.hop_count !== 0
+  ) {
+    throw new Error(
+      "Authenticated default-depth blacklist/stream-boundary search failed",
+    );
+  }
+  const clock = await post(
+    {
+      jsonrpc: "2.0",
+      id: nextId++,
+      method: "tools/call",
+      params: { name: "get_current_time", arguments: {} },
+    },
+    token,
+  );
+  const currentTime = clock.body?.result?.structuredContent;
+  if (
+    clock.body?.result?.isError !== false ||
+    !Number.isSafeInteger(currentTime?.unix_time_ms) ||
+    Date.parse(currentTime?.server_time_utc) !== currentTime?.unix_time_ms
+  ) {
+    throw new Error("Authenticated server clock failed");
+  }
   console.log("Authenticated graph-state lookup passed.");
   console.log("Authenticated profile lookup passed.");
   console.log("Authenticated bounded read passed.");
+  console.log(
+    "Authenticated typed search, blacklist/stream boundary and server clock passed.",
+  );
 } else {
   console.log("MCP_ACCESS_TOKEN was not set; authenticated read was skipped.");
 }

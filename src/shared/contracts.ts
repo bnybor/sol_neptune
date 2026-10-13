@@ -1,15 +1,37 @@
 import { z } from "zod";
 
-export const MAX_QUERY_BYTES = 65_536;
+export const MAX_QUERY_BYTES = 262_144;
 export const MAX_STRUCTURED_RESULT_BYTES = 1_048_576;
+export const DEFAULT_SEARCH_DEPTH = 3;
+export const MAX_SEARCH_DEPTH = 7;
 export const GRAPH_EXECUTE_SCOPE = "graph:execute";
 export const EXECUTOR_SOURCE = "sol-neptune-mcp";
+
+export const searchOptionsSchema = z
+  .object({
+    blacklist_query: z.string().min(1).max(MAX_QUERY_BYTES).optional(),
+    depth: z
+      .number()
+      .int()
+      .min(0)
+      .max(MAX_SEARCH_DEPTH)
+      .default(DEFAULT_SEARCH_DEPTH),
+  })
+  .strict();
+
+export const searchInputSchema = searchOptionsSchema.extend({
+  query: z.string().min(1).max(MAX_QUERY_BYTES),
+});
+
+export type SearchOptions = z.infer<typeof searchOptionsSchema>;
+export type SearchInput = z.infer<typeof searchInputSchema>;
 
 export const executorRequestSchema = z
   .object({
     source: z.literal(EXECUTOR_SOURCE),
     request_id: z.string().min(1).max(128),
     query: z.string().min(1),
+    search: searchOptionsSchema.optional(),
   })
   .strict();
 
@@ -21,6 +43,9 @@ export const errorCodeSchema = z.enum([
   "QUERY_INVALID",
   "QUERY_TIMEOUT",
   "RESULT_TOO_LARGE",
+  "RESULT_UNSUPPORTED",
+  "SEARCH_LIMIT_EXCEEDED",
+  "GRAPH_CHANGED",
   "NEPTUNE_UNAVAILABLE",
   "UNKNOWN_MUTATION_OUTCOME",
   "INTERNAL_ERROR",

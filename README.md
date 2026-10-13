@@ -1,6 +1,6 @@
 # Sol Neptune Gremlin MCP
 
-This repository implements the additive `sol-neptune-gremlin` version `2.1.1` tool surface. It preserves the separately constrained OAuth-protected `read_gremlin`, `write_gremlin`, and `delete_gremlin` graph actions plus the unchanged `get_profile` identity utility. It also exposes `get_graph_state`, `commit_semantic_delta`, and `reconcile_operation` for guarded typed semantic persistence through the same endpoint and authenticated connection.
+This repository implements the `sol-neptune-gremlin` version `2.2.0` tool surface. `search_gremlin` retrieves one typed GraphSON meta-graph with automatic neighborhoods, and `get_current_time` returns a fresh server-clock sample. The seven existing tools remain available, including deprecated `read_gremlin` compatibility reads and guarded typed semantic persistence through the same endpoint and authenticated connection.
 
 Neon is not read, written, migrated, synchronized, or reconfigured by this project. Neptune is not declared authoritative.
 
@@ -30,13 +30,22 @@ There is no NAT Gateway, Internet Gateway, public subnet, public Neptune instanc
 
 The public MCP Lambda classifies each submitted Gremlin-Groovy traversal before invoking the private executor:
 
+- `search_gremlin` accepts read-only seed and blacklist queries; its private execution path independently validates those queries and every generated traversal.
 - `read_gremlin` accepts only traversals classified as read-only.
 - `write_gremlin` requires a recognized add/update step (`addV`, `addE`, `mergeV`, `mergeE`, or `property`) and rejects `drop`.
 - `delete_gremlin` requires a recognized `drop` removal step.
 
 The classifier is deliberately deny-by-default. It tokenizes the full traversal, including nested anonymous traversals, while ignoring quoted string contents and comments. It rejects unknown calls and dynamic Groovy features such as statements, assignments, closures, interpolated method names, bracket dispatch, reflection-style invocation, and unsupported syntax. This is a conservative traversal subset rather than a complete Gremlin-Groovy parser: a safe but unsupported query is rejected with `QUERY_INVALID` and must be reformulated or added to the allowlist with tests. A rejected traversal must never be moved to another tool merely to bypass the classifier.
 
-The private executor, OAuth scope and subject checks, request IDs, GraphSON handling, result limits, and no-retry behavior are shared by all three graph tools. In particular, an ambiguous invocation failure continues to return `UNKNOWN_MUTATION_OUTCOME` and the caller must not retry blindly.
+The private executor, OAuth scope and subject checks, request IDs, result limits, and no-retry behavior are shared by the graph tools. All query strings, including generated semantic-commit queries, accept at most 262,144 UTF-8 bytes. In particular, an ambiguous invocation failure continues to return `UNKNOWN_MUTATION_OUTCOME` and the caller must not retry blindly.
+
+## Neighborhood search and server time
+
+`search_gremlin` takes `query`, optional `blacklist_query`, and `depth`: minimum **0**, default **3**, maximum **7**. It returns one typed GraphSON 3 meta-graph. Each meta-node contains a query-returnable typed value, g0 element, or explicit reference/fold descriptor; every meta-edge is one search hop. Ordinary node → edge → node, body references, and fold correspondences each cost two hops. Initial nodes retain every query position, preserving order and repeats. Blacklisted elements remain visible and never expand. `read_gremlin` remains available for compatibility; use `search_gremlin` at depth zero for new unexpanded reads.
+
+Positive-depth searches compare the writer's Neptune stream head before and after all reads. A moving boundary returns `GRAPH_CHANGED`, without a mixed graph. The executor therefore needs the existing enabled Streams feature and cluster-scoped `neptune-db:GetStreamRecords`; the template adds only that read permission. Node/hop/query/time/response limits fail explicitly, without a partial graph. Ambiguous g0 folds are reported with `search.complete=false` and `search.unresolved_folds`, rather than inventing a mapping from prose.
+
+`get_current_time` requires the same OAuth connection, takes no arguments, samples the server wall clock once per invocation, and returns `server_time_utc` and `unix_time_ms` for that same instant. It performs no graph I/O. [The API contract](docs/search-gremlin.md) defines identity, serialization, fold/reference interpretation, resource limits and error behavior.
 
 ## Typed semantic operations
 
@@ -50,7 +59,7 @@ The fresh-write phase is emitted as one multi-statement Gremlin request. Neptune
 
 `reconcile_operation` reloads the canonical request and allocation decisions from an existing receipt. It can idempotently continue missing non-destructive work, but it will not choose new IDs, reinterpret an operation ID, overwrite conflicting targets, perform cleanup deletion, or invent a replacement semantic request. Conflicting or destructively repairable state returns a stable structured error such as `OPERATION_ID_PAYLOAD_CONFLICT`, `RELATIONSHIP_CONFLICT`, `RECOVERY_NEEDED`, or `MANUAL_REPAIR_REQUIRED`.
 
-The existing MCP URL, OAuth resource, connection identity, and four original tool schemas are unchanged. An existing connection only needs its tool manifest refreshed or rescanned to discover the three additions.
+The MCP URL, OAuth resource and connection identity are unchanged. Existing raw Gremlin schemas advertise the increased query-size limit. Refresh or rescan the connection's tool manifest after deploying to discover the new search and clock tools.
 
 ## Repository layout
 
@@ -59,11 +68,13 @@ The existing MCP URL, OAuth resource, connection identity, and four original too
 - `src/mcp/semantic-contracts.ts` — strict typed-operation input contracts and public tool schemas.
 - `src/mcp/semantic-operations.ts` — canonicalization, guarded state machine, Neptune transaction generation, exact verification, and deterministic reconciliation.
 - `src/executor/` — VPC executor and Neptune Data API client.
+- `src/executor/search.ts` — bounded breadth-first meta-graph construction, explicit correspondence/reference provenance and stream-head fencing.
+- `src/shared/graphson.ts` — typed GraphSON identity and payload handling.
 - `src/shared/` — response contracts and safe structured logging.
 - `template.yaml` — dedicated SAM/CloudFormation stack.
 - `test/` — protocol, OAuth, executor, logging, and infrastructure tests.
 - `scripts/aws-preflight.sh` — read-only identity, Region, availability, resource, and cost check.
-- `scripts/smoke-test.mjs` — initialization, seven-tool discovery, OAuth challenge, and optional authenticated graph state, profile, plus bounded read.
+- `scripts/smoke-test.mjs` — initialization, nine-tool discovery, OAuth challenge, and optional authenticated graph state, profile, search and clock checks.
 - `scripts/integration-test.mjs` — uniquely identified create/read/delete/deletion-verification test for Neptune only.
 
 ## Local prerequisites and verification

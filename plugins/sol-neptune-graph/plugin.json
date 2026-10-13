@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "sol-neptune-graph",
-  "version": "0.3.0+codex.20260927033000",
+  "version": "0.4.0+codex.20261013",
   "description": "Authenticated Gremlin access to Sol's private Amazon Neptune graph.",
   "author": {
     "name": "Robyn"
@@ -11,8 +11,8 @@
     "com.openai": {
       "interface": {
         "displayName": "Sol Neptune Graph",
-        "shortDescription": "Use typed operations or Gremlin on Sol's private graph.",
-        "longDescription": "Use guarded typed semantic operations for routine persistence and OAuth-protected Gremlin tools for bounded inspection or exceptional graph work. Unknown mutation outcomes must never be retried blindly.",
+        "shortDescription": "Search Sol's graph with automatic neighborhood context.",
+        "longDescription": "Use typed GraphSON neighborhood search, a fresh server clock, guarded semantic persistence and separately constrained Gremlin tools. Unknown mutation outcomes must never be retried blindly.",
         "developerName": "Robyn",
         "category": "Productivity",
         "capabilities": ["Read", "Write"],

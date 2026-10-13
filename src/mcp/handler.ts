@@ -26,6 +26,7 @@ type HandlerDependencies = {
   invokeExecutor?: ExecutorInvoker;
   semanticOperations?: SemanticOperations;
   tokenVerifier?: TokenVerifier;
+  now?: () => number;
 };
 
 function jsonResponse(
@@ -82,6 +83,7 @@ async function toLambdaResponse(
   response.headers.forEach((value, key) => {
     headers[key] = value;
   });
+  headers["cache-control"] = "no-store";
   if (challenge) {
     headers["www-authenticate"] = challenge;
   }
@@ -157,6 +159,7 @@ export function createHandler(
         authorization: event.headers.authorization,
         config,
         invokeExecutor,
+        ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
         ...(dependencies.semanticOperations === undefined
           ? {}
           : { semanticOperations: dependencies.semanticOperations }),

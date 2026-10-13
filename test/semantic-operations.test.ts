@@ -887,6 +887,56 @@ function executionSuccess(data: unknown[]): ExecutionResponse {
 }
 
 describe("Gremlin semantic-operation backend", () => {
+  it("accepts compiled semantic queries above the old 64 KiB limit and rejects above 256 KiB", async () => {
+    const invokeExecutor = vi.fn().mockResolvedValue(executionSuccess([]));
+    const backend = createGremlinSemanticBackend(invokeExecutor);
+    const makePlan = (text: string): SemanticOperationPlan => ({
+      operationId: "large-query",
+      receiptId: "operation:large-query",
+      canonicalPayloadHash: "a".repeat(64),
+      canonicalPayloadJson: JSON.stringify({ canonical: text }),
+      authorityEpoch: "epoch-1",
+      origin: { identity: "sol", actor: "N1002", context: "test" },
+      createdAt: "2026-10-13T20:00:00Z",
+      revisions: {
+        before: { semantic: 10, graph: 10, projection: 10 },
+        after: { semantic: 11, graph: 11, projection: 11 },
+      },
+      allocatorBefore: {},
+      allocatorAfter: {},
+      allocatedIds: {},
+      creates: [
+        {
+          id: "S1",
+          graphLabel: "Object",
+          properties: {
+            object_type: "SOURCE_EVIDENCE",
+            major_version: 0,
+            canonical: text,
+          },
+        },
+      ],
+      updates: [],
+      relationships: [],
+    });
+    await backend.applyNewOperation(
+      makePlan("é".repeat(14_000)),
+      "large-request",
+    );
+    expect(invokeExecutor).toHaveBeenCalledOnce();
+    const query = invokeExecutor.mock.calls[0]?.[0] as string;
+    expect(Buffer.byteLength(query, "utf8")).toBeGreaterThan(65_536);
+    expect(Buffer.byteLength(query, "utf8")).toBeLessThanOrEqual(262_144);
+    invokeExecutor.mockClear();
+    await expect(
+      backend.applyNewOperation(
+        makePlan("é".repeat(100_000)),
+        "oversized-request",
+      ),
+    ).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+    expect(invokeExecutor).not.toHaveBeenCalled();
+  });
+
   it("maps the established control objects without inferring v1 authority", async () => {
     const invokeExecutor: ExecutorInvoker = vi.fn().mockResolvedValue(
       executionSuccess([

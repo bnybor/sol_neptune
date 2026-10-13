@@ -1,5 +1,6 @@
 import {
   ExecuteGremlinQueryCommand,
+  GetPropertygraphStreamCommand,
   type ExecuteGremlinQueryCommandOutput,
 } from "@aws-sdk/client-neptunedata";
 import type { Context } from "aws-lambda";
@@ -22,6 +23,8 @@ import {
   resetNeptuneClient,
   type NeptuneSender,
 } from "./neptune-client.js";
+import { validateGremlinForTool } from "../mcp/gremlin-safety.js";
+import { SearchFailure, searchGremlin } from "./search.js";
 
 const GREMLIN_SERIALIZER = "application/vnd.gremlin-v3.0+json;types=false";
 
@@ -222,10 +225,29 @@ export function createExecutorHandler(
       return response;
     }
 
-    if (Buffer.byteLength(parsed.data.query, "utf8") > MAX_QUERY_BYTES) {
+    if (
+      Buffer.byteLength(parsed.data.query, "utf8") > MAX_QUERY_BYTES ||
+      (parsed.data.search?.blacklist_query !== undefined &&
+        Buffer.byteLength(parsed.data.search.blacklist_query, "utf8") >
+          MAX_QUERY_BYTES)
+    ) {
       return failure(
         "QUERY_INVALID",
-        "The Gremlin query exceeds 65,536 UTF-8 bytes.",
+        `The Gremlin query exceeds ${MAX_QUERY_BYTES.toLocaleString("en-US")} UTF-8 bytes.`,
+        requestId,
+      );
+    }
+
+    if (
+      parsed.data.search !== undefined &&
+      (!validateGremlinForTool(parsed.data.query, "read").ok ||
+        (parsed.data.search.blacklist_query !== undefined &&
+          !validateGremlinForTool(parsed.data.search.blacklist_query, "read")
+            .ok))
+    ) {
+      return failure(
+        "QUERY_INVALID",
+        "Search seed and blacklist queries must both be verified read-only.",
         requestId,
       );
     }
@@ -234,23 +256,104 @@ export function createExecutorHandler(
     let caughtError: unknown;
     try {
       const client = deps.getClient();
-      const output: ExecuteGremlinQueryCommandOutput = await client.send(
-        new ExecuteGremlinQueryCommand({
-          gremlinQuery: parsed.data.query,
-          serializer: GREMLIN_SERIALIZER,
-        }),
-      );
-      response = successResponse(
-        output.result ?? null,
-        requestId,
-        deps.now() - startedAt,
-      );
+      if (parsed.data.search !== undefined) {
+        const deadline = deps.now() + 11_000;
+        const sendOptions = (): { abortSignal: AbortSignal } => {
+          const remaining = deadline - deps.now();
+          if (remaining <= 0)
+            throw new SearchFailure(
+              "QUERY_TIMEOUT",
+              "The search exceeded its execution budget.",
+            );
+          return { abortSignal: AbortSignal.timeout(Math.ceil(remaining)) };
+        };
+        const result = await searchGremlin(
+          { query: parsed.data.query, ...parsed.data.search },
+          {
+            async query(query) {
+              if (!validateGremlinForTool(query, "read").ok) {
+                throw new SearchFailure(
+                  "QUERY_INVALID",
+                  "An internal search traversal failed read-only validation.",
+                );
+              }
+              const output = await client.send(
+                new ExecuteGremlinQueryCommand({
+                  gremlinQuery: query,
+                  serializer: "application/vnd.gremlin-v3.0+json",
+                }),
+                sendOptions(),
+              );
+              const result = output.result ?? { data: [] };
+              if (
+                Buffer.byteLength(JSON.stringify(result), "utf8") >
+                MAX_STRUCTURED_RESULT_BYTES
+              ) {
+                throw new SearchFailure(
+                  "RESULT_TOO_LARGE",
+                  "A search read exceeds the response limit; narrow the query or blacklist hubs.",
+                );
+              }
+              return result;
+            },
+            async streamHead() {
+              const output = await client.send(
+                new GetPropertygraphStreamCommand({
+                  iteratorType: "LATEST",
+                  limit: 1,
+                }),
+                sendOptions(),
+              );
+              const head = output.lastEventId;
+              if (
+                !head ||
+                typeof head.commitNum !== "string" ||
+                typeof head.opNum !== "string"
+              ) {
+                throw new SearchFailure(
+                  "NEPTUNE_UNAVAILABLE",
+                  "A Neptune stream head is required for consistent multi-query search.",
+                );
+              }
+              return { commitNum: head.commitNum, opNum: head.opNum };
+            },
+          },
+          { now: deps.now },
+        );
+        response = successResponse(result, requestId, deps.now() - startedAt);
+      } else {
+        const output: ExecuteGremlinQueryCommandOutput = await client.send(
+          new ExecuteGremlinQueryCommand({
+            gremlinQuery: parsed.data.query,
+            serializer: GREMLIN_SERIALIZER,
+          }),
+        );
+        response = successResponse(
+          output.result ?? null,
+          requestId,
+          deps.now() - startedAt,
+        );
+      }
     } catch (error) {
       caughtError = error;
       if (isConnectionLevelFailure(error)) {
         deps.resetClient();
       }
-      response = mapNeptuneError(error, requestId, deps.now() - startedAt);
+      response =
+        error instanceof SearchFailure
+          ? failure(error.code, error.message, requestId, {
+              elapsedMs: deps.now() - startedAt,
+              resultBytes: 0,
+            })
+          : parsed.data.search !== undefined &&
+              errorName(error) === "AbortError"
+            ? failure(
+                "QUERY_TIMEOUT",
+                "The search exceeded its execution budget; no partial graph is returned.",
+                requestId,
+                { elapsedMs: deps.now() - startedAt, resultBytes: 0 },
+              )
+            : mapNeptuneError(error, requestId, deps.now() - startedAt);
     }
 
     const fields = {

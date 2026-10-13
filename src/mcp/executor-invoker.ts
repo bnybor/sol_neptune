@@ -4,11 +4,13 @@ import {
   EXECUTOR_SOURCE,
   executionResponseSchema,
   type ExecutionResponse,
+  type SearchOptions,
 } from "../shared/contracts.js";
 
 export type ExecutorInvoker = (
   query: string,
   requestId: string,
+  options?: { search: SearchOptions },
 ) => Promise<ExecutionResponse>;
 
 export class ExecutorInvocationError extends Error {
@@ -29,7 +31,7 @@ export function createExecutorInvoker(
     maxAttempts: LAMBDA_CLIENT_MAX_ATTEMPTS,
   }),
 ): ExecutorInvoker {
-  return async (query, requestId) => {
+  return async (query, requestId, options) => {
     try {
       const output = await client.send(
         new InvokeCommand({
@@ -40,6 +42,7 @@ export function createExecutorInvoker(
               source: EXECUTOR_SOURCE,
               request_id: requestId,
               query,
+              ...(options ?? {}),
             }),
           ),
         }),

@@ -1,4 +1,5 @@
 import type { ExecutionResponse } from "../src/shared/contracts.js";
+import { MAX_QUERY_BYTES } from "../src/shared/contracts.js";
 import { TokenValidationError } from "../src/mcp/auth.js";
 import type { McpConfig } from "../src/mcp/config.js";
 import { ExecutorInvocationError } from "../src/mcp/executor-invoker.js";
@@ -57,7 +58,20 @@ describe("MCP Lambda handler", () => {
     const result = resultOf(parseResponseBody(response.body));
     const tools = result.tools as Record<string, unknown>[];
 
-    expect(tools).toHaveLength(7);
+    expect(tools).toHaveLength(9);
+    expect(tools.find((tool) => tool.name === "search_gremlin")).toMatchObject({
+      inputSchema: {
+        properties: {
+          depth: { minimum: 0, default: 3, maximum: 7 },
+          query: { maxLength: MAX_QUERY_BYTES },
+          blacklist_query: { maxLength: MAX_QUERY_BYTES },
+        },
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false },
+    });
+    expect(
+      tools.find((tool) => tool.name === "get_current_time"),
+    ).toBeDefined();
     const readTool = tools.find((tool) => tool.name === "read_gremlin");
     const writeTool = tools.find((tool) => tool.name === "write_gremlin");
     const deleteTool = tools.find((tool) => tool.name === "delete_gremlin");
@@ -81,7 +95,7 @@ describe("MCP Lambda handler", () => {
         additionalProperties: false,
         required: ["query"],
         properties: {
-          query: { type: "string", minLength: 1, maxLength: 65_536 },
+          query: { type: "string", minLength: 1, maxLength: MAX_QUERY_BYTES },
         },
       },
       annotations: {
@@ -344,7 +358,7 @@ describe("MCP Lambda handler", () => {
         authorization: "Bearer valid-token",
         body: jsonRpcRequest("tools/call", {
           name: "read_gremlin",
-          arguments: { query: "é".repeat(32_769) },
+          arguments: { query: "é".repeat(MAX_QUERY_BYTES / 2 + 1) },
         }),
       }),
       context,

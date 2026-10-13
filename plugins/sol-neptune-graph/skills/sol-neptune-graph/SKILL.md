@@ -1,6 +1,6 @@
 ---
 name: sol-neptune-graph
-description: Read or explicitly update Sol's private Amazon Neptune graph through guarded typed semantic operations and the OAuth-protected read_gremlin, write_gremlin, and delete_gremlin escape hatches. Use for graph-state reads, routine semantic persistence, deterministic operation recovery, bounded Gremlin inspection, or exceptional user-requested graph mutations. Never route these operations to Neon.
+description: Read or explicitly update Sol's private Amazon Neptune graph through search_gremlin, guarded typed semantic operations and separately constrained Gremlin tools. Use get_current_time for a fresh server timestamp. Never route these operations to Neon.
 ---
 
 # Sol Neptune Graph
@@ -22,11 +22,12 @@ Temporary `$...` references let one request create related records without predi
 - Prefer `get_graph_state`, `commit_semantic_delta`, and `reconcile_operation` for routine foreground semantic persistence.
 - Keep semantic cognition at the caller: supply exact objects, properties, relationships, provenance, revision effects, and any explicit supersession. Do not ask the server to infer them.
 - Typed semantic commits are major-version-0-only and non-destructive. They cannot remove properties, edges, or vertices and cannot carry arbitrary Gremlin.
-- Use `read_gremlin` for reads. It is server-enforced read-only and rejects syntax or steps the classifier cannot verify.
+- Prefer `search_gremlin` for reads: minimum depth 0, default 3, maximum 7. It returns one typed GraphSON meta-graph, with query positions on initial nodes and two hops per physical/reference/fold connection. Use a read-only `blacklist_query` to stop expansion at hubs. Check `search.complete` and `search.unresolved_folds`; ambiguous folds are not invented. Depth 0 preserves unexpanded typed query results. `read_gremlin` remains a deprecated compatibility read.
+- Use `get_current_time` for a fresh UTC timestamp and epoch milliseconds from the same server-clock sample. It performs no graph I/O.
 - Use `write_gremlin` only when the user explicitly requests additions or updates. It rejects pure reads and removals.
 - Use `delete_gremlin` only when the user explicitly requests removal of vertices, edges, or properties.
 - Bound every potentially large traversal with `limit()`, `range()`, `count()`, or another explicit result bound.
-- Keep queries within the server's 65,536-byte input limit and results within its 1 MiB structured-result limit.
+- Keep each query within the server's 262,144-byte UTF-8 input limit and results within its 1 MiB structured-result limit. Search resource limits fail without returning a partial graph; refine depth or blacklist rather than assuming a truncated result is complete. `GRAPH_CHANGED` means a moving stream boundary; the read may be repeated.
 - Before a mutation, identify the intended vertices, edges, labels, and stable identifiers precisely enough to avoid broad changes.
 - Use stable identifiers or idempotent upserts when practical.
 - Do not move a rejected traversal to a less restrictive tool merely to bypass classification. Reformulate it within the documented conservative traversal subset or explain that the server rejected it.

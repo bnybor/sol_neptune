@@ -2011,7 +2011,7 @@ export function createGremlinSemanticBackend(
     if (Buffer.byteLength(query, "utf8") > MAX_QUERY_BYTES) {
       throw new SemanticFailure(
         "VALIDATION_ERROR",
-        "The deterministic semantic operation exceeds the 65,536-byte Neptune query limit.",
+        "The deterministic semantic operation exceeds the 262,144-byte Neptune query limit.",
         false,
         { query_bytes: Buffer.byteLength(query, "utf8") },
       );

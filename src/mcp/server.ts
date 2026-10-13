@@ -12,6 +12,10 @@ import {
   failure,
   GRAPH_EXECUTE_SCOPE,
   MAX_QUERY_BYTES,
+  DEFAULT_SEARCH_DEPTH,
+  MAX_SEARCH_DEPTH,
+  searchInputSchema,
+  type SearchOptions,
   type ExecutionFailure,
   type ExecutionResponse,
 } from "../shared/contracts.js";
@@ -52,11 +56,11 @@ import {
 } from "./semantic-operations.js";
 
 export const SERVER_INSTRUCTIONS =
-  "This server exposes Sol's private structural graph through typed semantic operations and separate read, non-destructive write, and destructive-delete Gremlin tools. Prefer guarded typed operations for routine semantic persistence. Use read_gremlin for bounded reads, write_gremlin only for explicitly requested additions or updates, and delete_gremlin only for explicitly requested removals. Never retry an unknown mutation outcome blindly.";
+  "This server exposes Sol's private structural graph through typed semantic operations and separate read, non-destructive write, and destructive-delete Gremlin tools. Prefer search_gremlin for reads: it returns one typed GraphSON meta-graph, with depth 0 for unexpanded results, default depth 3, maximum depth 7, and a read-only blacklist query. Every connection costs two hops. Query positions preserve result order and repetition. Check search.complete and unresolved_folds; size or execution limits fail without returning a partial graph. read_gremlin is a deprecated compatibility read. All query inputs are limited to 262,144 UTF-8 bytes. Use get_current_time for fresh server UTC and epoch time. Prefer guarded typed operations for routine semantic persistence. Use write_gremlin only for explicitly requested additions or updates and delete_gremlin only for explicitly requested removals. Never retry an unknown mutation outcome blindly.";
 
 const queryInput = z
   .object({
-    query: z.string().min(1).max(65_536),
+    query: z.string().min(1).max(MAX_QUERY_BYTES),
   })
   .strict();
 
@@ -74,9 +78,9 @@ const gremlinInputSchema = {
     query: {
       type: "string",
       minLength: 1,
-      maxLength: 65_536,
+      maxLength: MAX_QUERY_BYTES,
       description:
-        "A Gremlin traversal to execute against Sol's Neptune graph.",
+        "A Gremlin traversal to execute against Sol's Neptune graph. Maximum 262,144 UTF-8 bytes.",
     },
   },
 } as const;
@@ -94,7 +98,7 @@ export const readGremlinTool = {
   name: "read_gremlin",
   title: "Read Gremlin",
   description:
-    "Use this for bounded, read-only Gremlin traversals against Sol's private Neptune graph. This action cannot mutate the graph: the server rejects every traversal it cannot verify as non-mutating.",
+    "Deprecated compatibility read: prefer search_gremlin, using depth 0 for unexpanded results. This action cannot mutate the graph: the server rejects every traversal it cannot verify as non-mutating.",
   inputSchema: gremlinInputSchema,
   outputSchema: gremlinOutputSchema,
   annotations: {
@@ -106,6 +110,64 @@ export const readGremlinTool = {
   _meta: {
     securitySchemes,
   },
+} as const;
+
+export const searchGremlinTool = {
+  name: "search_gremlin",
+  title: "Search Gremlin with graph context",
+  description:
+    "Execute a verified read-only query and return one typed GraphSON 3 meta-graph. Vertex-edge-vertex, body references and explicit g0 shaped_like correspondences each cost two hops. Depth minimum 0, default 3, maximum 7. Initial meta-nodes retain all query positions; expansion-only nodes have none. Reached blacklist matches remain visible but do not expand. Scalars and compound values are terminals. Successful expansion is fenced by an unchanged Neptune stream head. Ambiguous folds are reported in search.unresolved_folds with search.complete=false; resource limits fail without a partial result.",
+  inputSchema: {
+    type: "object",
+    additionalProperties: false,
+    required: ["query"],
+    properties: {
+      query: gremlinInputSchema.properties.query,
+      blacklist_query: {
+        ...gremlinInputSchema.properties.query,
+        description:
+          "Optional verified read-only query selecting terminal values/elements. Derived descriptor IDs may be selected with g.inject('search:...'). Omitted means no blacklist. Maximum 262,144 UTF-8 bytes.",
+      },
+      depth: {
+        type: "integer",
+        minimum: 0,
+        default: DEFAULT_SEARCH_DEPTH,
+        maximum: MAX_SEARCH_DEPTH,
+      },
+    },
+  },
+  outputSchema: gremlinOutputSchema,
+  annotations: {
+    readOnlyHint: true,
+    destructiveHint: false,
+    openWorldHint: false,
+  },
+  securitySchemes,
+  _meta: { securitySchemes },
+} as const;
+
+export const getCurrentTimeTool = {
+  name: "get_current_time",
+  title: "Get current server time",
+  description:
+    "Sample the server wall clock on every invocation, without caching or graph I/O. UTC and epoch milliseconds describe the same instant.",
+  inputSchema: { type: "object", additionalProperties: false, properties: {} },
+  outputSchema: {
+    type: "object",
+    additionalProperties: false,
+    required: ["server_time_utc", "unix_time_ms"],
+    properties: {
+      server_time_utc: { type: "string", format: "date-time" },
+      unix_time_ms: { type: "integer" },
+    },
+  },
+  annotations: {
+    readOnlyHint: true,
+    destructiveHint: false,
+    openWorldHint: false,
+  },
+  securitySchemes,
+  _meta: { securitySchemes },
 } as const;
 
 export const writeGremlinTool = {
@@ -269,6 +331,7 @@ type ServerDependencies = {
   onAuthChallenge?: (challenge: string) => void;
   semanticOperations?: SemanticOperations;
   tokenVerifier: TokenVerifier;
+  now?: () => number;
 };
 
 function errorToolResult(
@@ -386,6 +449,7 @@ export function createMcpServer(dependencies: ServerDependencies): Server {
     // The current SDK transport permits OpenAI's securitySchemes extension even
     // though its published TypeScript Tool type has not yet added that field.
     tools: [
+      searchGremlinTool,
       readGremlinTool,
       writeGremlinTool,
       deleteGremlinTool,
@@ -393,12 +457,15 @@ export function createMcpServer(dependencies: ServerDependencies): Server {
       getGraphStateTool,
       commitSemanticDeltaTool,
       reconcileOperationTool,
+      getCurrentTimeTool,
     ],
   }));
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const requestId = randomUUID();
-    const mode = gremlinToolMode(request.params.name);
+    const isSearch = request.params.name === searchGremlinTool.name;
+    const isTime = request.params.name === getCurrentTimeTool.name;
+    const mode = isSearch ? "read" : gremlinToolMode(request.params.name);
     const isGremlin = mode !== undefined;
     const isProfile = request.params.name === getProfileTool.name;
     const isGraphState = request.params.name === getGraphStateTool.name;
@@ -411,7 +478,8 @@ export function createMcpServer(dependencies: ServerDependencies): Server {
       !isProfile &&
       !isGraphState &&
       !isSemanticCommit &&
-      !isReconciliation
+      !isReconciliation &&
+      !isTime
     ) {
       return errorToolResult(
         failure(
@@ -423,9 +491,12 @@ export function createMcpServer(dependencies: ServerDependencies): Server {
     }
 
     let query: string | undefined;
+    let searchOptions: SearchOptions | undefined;
     let semanticInput: unknown;
     if (isGremlin) {
-      const input = queryInput.safeParse(request.params.arguments);
+      const input = (isSearch ? searchInputSchema : queryInput).safeParse(
+        request.params.arguments,
+      );
       if (
         !input.success ||
         Buffer.byteLength(input.data.query, "utf8") > MAX_QUERY_BYTES
@@ -439,10 +510,37 @@ export function createMcpServer(dependencies: ServerDependencies): Server {
         );
       }
       query = input.data.query;
-    } else if (isProfile) {
+      if (isSearch) {
+        const search = searchInputSchema.parse(input.data);
+        if (
+          search.blacklist_query !== undefined &&
+          Buffer.byteLength(search.blacklist_query, "utf8") > MAX_QUERY_BYTES
+        ) {
+          return errorToolResult(
+            failure(
+              "QUERY_INVALID",
+              "The blacklist query exceeds 262,144 UTF-8 bytes.",
+              requestId,
+            ),
+          );
+        }
+        searchOptions = {
+          depth: search.depth,
+          ...(search.blacklist_query === undefined
+            ? {}
+            : { blacklist_query: search.blacklist_query }),
+        };
+      }
+    } else if (isProfile || isTime) {
       if (!profileInput.safeParse(request.params.arguments ?? {}).success) {
         return errorToolResult(
-          failure("QUERY_INVALID", "The profile input is invalid.", requestId),
+          failure(
+            "QUERY_INVALID",
+            isTime
+              ? "The current-time input is invalid."
+              : "The profile input is invalid.",
+            requestId,
+          ),
         );
       }
     } else if (isGraphState) {
@@ -522,6 +620,18 @@ export function createMcpServer(dependencies: ServerDependencies): Server {
     if (isProfile) {
       return profileResult(subject);
     }
+    if (isTime) {
+      const unixTimeMs = (dependencies.now ?? Date.now)();
+      const result = {
+        server_time_utc: new Date(unixTimeMs).toISOString(),
+        unix_time_ms: unixTimeMs,
+      };
+      return {
+        content: [{ type: "text", text: JSON.stringify(result) }],
+        structuredContent: result,
+        isError: false,
+      };
+    }
 
     const semanticOperations =
       dependencies.semanticOperations ??
@@ -571,8 +681,26 @@ export function createMcpServer(dependencies: ServerDependencies): Server {
       );
     }
 
+    if (
+      searchOptions?.blacklist_query !== undefined &&
+      !validateGremlinForTool(searchOptions.blacklist_query, "read").ok
+    ) {
+      return errorToolResult(
+        failure(
+          "QUERY_INVALID",
+          "The blacklist query must be verified read-only.",
+          requestId,
+        ),
+      );
+    }
+
     try {
-      const response = await dependencies.invokeExecutor(query, requestId);
+      const response =
+        searchOptions === undefined
+          ? await dependencies.invokeExecutor(query, requestId)
+          : await dependencies.invokeExecutor(query, requestId, {
+              search: searchOptions,
+            });
       return asToolResult(response);
     } catch (error) {
       const response = failure(
