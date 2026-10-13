@@ -1,4 +1,4 @@
-# g0 MCP search contract — 2.2.0
+# g0 MCP search contract — 2.2.1
 
 This implements the October 13, 2026 discussion (Neptune S1003101–S1003125), amended in Codex to cap depth at 7. The endpoint remains the existing g0 MCP endpoint. The change includes automatic neighborhood search, a 256 KiB query limit across functions, and an independent server-clock tool. Implementation in this checkout does not imply production deployment.
 
@@ -75,7 +75,7 @@ Resource bounds are explicit:
 
 Node/hop/query/reference limits return `SEARCH_LIMIT_EXCEEDED`. Timeout returns `QUERY_TIMEOUT`. Oversized results return `RESULT_TOO_LARGE`. Those errors contain **no partial graph**. Narrow the seed query, blacklist hubs, or reduce depth. There is no paging token or implicit truncation in this release. Successful results report requested depth, query-result/node/hop/query counts, consistency mode and boundary. `complete=true` means all permitted connections under this explicit correspondence contract were examined to the requested depth; ambiguity is reported separately as described above.
 
-The private executor uses typed GraphSON 3 for search subqueries; existing raw and semantic operations retain their original serializer. SDK retry counts remain one, and no automatic retry or mutation is introduced by search.
+The private executor uses typed GraphSON 3 for search subqueries; existing raw and semantic operations retain their original serializer. Neptune's numeric stream coordinates and exact decimal-string coordinates are normalized to strings; unsafe numeric integers fail rather than round. SDK retry counts remain one, and no automatic retry or mutation is introduced by search.
 
 ## Clock
 

@@ -46,6 +46,19 @@ function errorName(error: unknown): string {
   return sanitizedErrorClass(error);
 }
 
+function streamCoordinate(value: unknown): string | undefined {
+  // Neptune emits numeric coordinates despite the SDK's string-map model.
+  // Normalize only exact integers so the consistency fence cannot round.
+  if (typeof value === "number") {
+    return Number.isSafeInteger(value) && value >= 0
+      ? String(value)
+      : undefined;
+  }
+  return typeof value === "string" && /^(0|[1-9][0-9]*)$/u.test(value)
+    ? value
+    : undefined;
+}
+
 function httpStatus(error: unknown): number | undefined {
   if (
     typeof error === "object" &&
@@ -305,17 +318,15 @@ export function createExecutorHandler(
                 sendOptions(),
               );
               const head = output.lastEventId;
-              if (
-                !head ||
-                typeof head.commitNum !== "string" ||
-                typeof head.opNum !== "string"
-              ) {
+              const commitNum = streamCoordinate(head?.commitNum);
+              const opNum = streamCoordinate(head?.opNum);
+              if (commitNum === undefined || opNum === undefined) {
                 throw new SearchFailure(
                   "NEPTUNE_UNAVAILABLE",
                   "A Neptune stream head is required for consistent multi-query search.",
                 );
               }
-              return { commitNum: head.commitNum, opNum: head.opNum };
+              return { commitNum, opNum };
             },
           },
           { now: deps.now },

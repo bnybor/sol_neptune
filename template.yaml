@@ -288,7 +288,7 @@ Resources:
           EXECUTOR_FUNCTION_NAME: !Ref ExecutorFunction
           MCP_ENABLED: !Ref McpEnabled
           OAUTH_ISSUER: !Ref OAuthIssuer
-          SERVICE_VERSION: 2.2.0
+          SERVICE_VERSION: 2.2.1
       Policies:
         - Version: "2012-10-17"
           Statement:

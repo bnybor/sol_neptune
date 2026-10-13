@@ -106,32 +106,73 @@ describe("private Neptune executor", () => {
     });
     expect(send).toHaveBeenCalledOnce();
   });
-  it("allows depth 7 and fences expansion by the unchanged stream head", async () => {
-    const send = vi.fn((command: unknown) =>
-      Promise.resolve(
-        command instanceof GetPropertygraphStreamCommand
-          ? { lastEventId: { commitNum: "42", opNum: "2" } }
-          : { result: { data: typed("g:List", [typed("g:Int64", 42)]) } },
-      ),
-    );
-    const handler = createExecutorHandler({
-      getClient: () => ({ send }) as NeptuneSender,
-    });
-    expect(
-      await handler(
-        { ...baseEvent, query: "g.V().count()", search: { depth: 7 } },
-        context,
-      ),
-    ).toMatchObject({
-      ok: true,
-      result: { search: { consistency: "unchanged_neptune_stream_head" } },
-    });
-    expect(
-      send.mock.calls.filter(
-        ([command]) => command instanceof GetPropertygraphStreamCommand,
-      ),
-    ).toHaveLength(2);
-  });
+  it.each([
+    { commitNum: "42", opNum: "2" },
+    { commitNum: 42, opNum: 2 },
+    { commitNum: "9007199254740993", opNum: 2 },
+  ])(
+    "allows depth 7 and fences expansion by exact stream head %j",
+    async (head) => {
+      const send = vi.fn((command: unknown) =>
+        Promise.resolve(
+          command instanceof GetPropertygraphStreamCommand
+            ? { lastEventId: head }
+            : { result: { data: typed("g:List", [typed("g:Int64", 42)]) } },
+        ),
+      );
+      const handler = createExecutorHandler({
+        getClient: () => ({ send }) as NeptuneSender,
+      });
+      expect(
+        await handler(
+          { ...baseEvent, query: "g.V().count()", search: { depth: 7 } },
+          context,
+        ),
+      ).toMatchObject({
+        ok: true,
+        result: {
+          search: {
+            consistency: "unchanged_neptune_stream_head",
+            stream_head: {
+              commitNum: String(head.commitNum),
+              opNum: String(head.opNum),
+            },
+          },
+        },
+      });
+      expect(
+        send.mock.calls.filter(
+          ([command]) => command instanceof GetPropertygraphStreamCommand,
+        ),
+      ).toHaveLength(2);
+    },
+  );
+  it.each([
+    Number.MAX_SAFE_INTEGER + 1,
+    -1,
+    0.5,
+    true,
+    "01",
+    "invalid",
+    undefined,
+  ])(
+    "rejects an inexact or invalid stream coordinate %s before reading the graph",
+    async (commitNum) => {
+      const send = vi.fn().mockResolvedValue({
+        lastEventId: { commitNum, opNum: 1 },
+      });
+      const handler = createExecutorHandler({
+        getClient: () => ({ send }) as NeptuneSender,
+      });
+      expect(
+        await handler({ ...baseEvent, search: { depth: 3 } }, context),
+      ).toMatchObject({
+        ok: false,
+        error: { code: "NEPTUNE_UNAVAILABLE" },
+      });
+      expect(send).toHaveBeenCalledOnce();
+    },
+  );
   it.each([
     { query: "g.V()", search: { depth: 8 } },
     { query: "g.V()", search: { depth: -1 } },

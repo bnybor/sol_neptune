@@ -1,6 +1,6 @@
 # Sol Neptune Gremlin MCP
 
-This repository implements the `sol-neptune-gremlin` version `2.2.0` tool surface. `search_gremlin` retrieves one typed GraphSON meta-graph with automatic neighborhoods, and `get_current_time` returns a fresh server-clock sample. The seven existing tools remain available, including deprecated `read_gremlin` compatibility reads and guarded typed semantic persistence through the same endpoint and authenticated connection.
+This repository implements the `sol-neptune-gremlin` version `2.2.1` tool surface. `search_gremlin` retrieves one typed GraphSON meta-graph with automatic neighborhoods, and `get_current_time` returns a fresh server-clock sample. The seven existing tools remain available, including deprecated `read_gremlin` compatibility reads and guarded typed semantic persistence through the same endpoint and authenticated connection.
 
 Neon is not read, written, migrated, synchronized, or reconfigured by this project. Neptune is not declared authoritative.
 
